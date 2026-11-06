@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-15-intel]
+        os: [macos-15-intel, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Descargar repositorio
@@ -33,10 +33,15 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Empaquetar archivo Raw8KCam.ipa
+      - name: Empaquetar archivo Raw8KCam.ipa y garantizar permisos en Info.plist
         run: |
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/Raw8KCam.app Payload/
+          plutil -replace NSCameraUsageDescription -string "Raw8KCam necesita acceso directo al sensor de la cámara para capturar fotos en Bayer RAW (.DNG) y grabar video en 8K." Payload/Raw8KCam.app/Info.plist
+          plutil -replace NSMicrophoneUsageDescription -string "Raw8KCam necesita acceso al micrófono para grabar audio AAC de alta fidelidad junto con tus videos 8K." Payload/Raw8KCam.app/Info.plist
+          plutil -replace NSPhotoLibraryUsageDescription -string "Raw8KCam necesita acceso a tu fototeca para guardar y verificar tus archivos RAW (.DNG) y videos 8K (.MOV)." Payload/Raw8KCam.app/Info.plist
+          plutil -replace NSPhotoLibraryAddUsageDescription -string "Raw8KCam guarda directamente en tu carrete los negativos digitales .DNG y los videos 8K." Payload/Raw8KCam.app/Info.plist
+          plutil -p Payload/Raw8KCam.app/Info.plist
           zip -r9 Raw8KCam.ipa Payload
 
       - name: Subir Raw8KCam.ipa listo para Sideloadly / SideStore / AltStore

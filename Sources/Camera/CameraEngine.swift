@@ -1,9 +1,11 @@
 import AVFoundation
 import CoreImage
 import CoreMedia
+import ImageIO
 import Metal
 import Photos
 import SwiftUI
+import UniformTypeIdentifiers
 import VideoToolbox
 
 enum CaptureMode: String, CaseIterable, Identifiable {
@@ -16,7 +18,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .rawPhoto:
-            return "Bayer RAW .DNG (12/14-bit) sin procesado Deep Fusion"
+            return "Bayer RAW .DNG / 16-bit sin procesado Deep Fusion"
         case .video8KFluid:
             return "Open Gate 4032×3024 → Metal GPU 8K (7680×4320) HEVC 120 Mbps 30/60fps"
         case .video8KSensor48MP:
@@ -54,7 +56,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     @Published var isRecording: Bool = false
     @Published var isCapturingPhoto: Bool = false
-    @Published var statusBanner: String = "Listo"
+    @Published var statusBanner: String = "Iniciando cámara..."
     @Published var activeSensorFormatText: String = "Detectando sensor..."
     @Published var measuredFPS: Double = 0.0
     @Published var recordedFramesCount: Int = 0
@@ -77,6 +79,7 @@ final class CameraEngine: NSObject, ObservableObject {
     private let videoQueue = DispatchQueue(label: "com.raw8kcam.videoOutput", qos: .userInteractive)
     private let audioQueue = DispatchQueue(label: "com.raw8kcam.audioOutput", qos: .userInitiated)
 
+    private var isSessionConfigured = false
     private var videoDeviceInput: AVCaptureDeviceInput?
     private let photoOutput = AVCapturePhotoOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -102,67 +105,99 @@ final class CameraEngine: NSObject, ObservableObject {
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var recordingStartPTS: CMTime?
     private var burstFrameIndex: Int64 = 0
-    private var lastFrameTimestamp: CFAbsoluteTime = 0
     private var frameCounterWindow: Int = 0
     private var fpsWindowStart: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
 
     override init() {
         super.init()
-        requestPermissionsAndStart()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.requestPermissionsAndStart()
+        }
     }
 
-    // MARK: - Permisos e Inicialización
+    // MARK: - Permisos e Inicialización Secuencial Segura
     func requestPermissionsAndStart() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-            guard granted, let self else {
-                DispatchQueue.main.async { self?.statusBanner = "Permiso de cámara denegado" }
+            guard let self else { return }
+            guard granted else {
+                DispatchQueue.main.async {
+                    self.statusBanner = "Permiso de cámara denegado en Ajustes"
+                }
                 return
             }
-            AVCaptureDevice.requestAccess(for: .audio) { _ in }
-            PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in }
-            self.sessionQueue.async {
-                self.setupSession()
+            AVCaptureDevice.requestAccess(for: .audio) { _ in
+                PHPhotoLibrary.requestAuthorization(for: .addOnly) { _ in
+                    self.sessionQueue.async {
+                        self.setupSession()
+                    }
+                }
             }
         }
     }
 
     private func setupSession() {
-        session.beginConfiguration()
-        session.sessionPreset = .inputPriority
+        guard !isSessionConfigured else { return }
 
-        // Entrada de micrófono
-        if let mic = AVCaptureDevice.default(for: .audio),
-           let micInput = try? AVCaptureDeviceInput(device: mic),
-           session.canAddInput(micInput) {
-            session.addInput(micInput)
+        let errMsg = ObjCCatcher.catchException {
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
+
+            // 1. Entrada de cámara principal primero (obligatorio antes de configurar salidas)
+            if let cam = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+               let camInput = try? AVCaptureDeviceInput(device: cam),
+               self.session.canAddInput(camInput) {
+                self.session.addInput(camInput)
+                self.videoDeviceInput = camInput
+            }
+
+            // 2. Entrada de micrófono
+            if let mic = AVCaptureDevice.default(for: .audio),
+               let micInput = try? AVCaptureDeviceInput(device: mic),
+               self.session.canAddInput(micInput) {
+                self.session.addInput(micInput)
+            }
+
+            // 3. Salida de foto (para RAW .DNG y ráfaga 48MP 8K)
+            if self.session.canAddOutput(self.photoOutput) {
+                self.session.addOutput(self.photoOutput)
+            }
+
+            // 4. Salida de muestras de video (para Open Gate 4032x3024 -> 8K Metal)
+            self.videoDataOutput.alwaysDiscardsLateVideoFrames = true
+            self.videoDataOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
+            if self.session.canAddOutput(self.videoDataOutput) {
+                self.session.addOutput(self.videoDataOutput)
+            }
+
+            // 5. Salida de muestras de audio
+            self.audioDataOutput.setSampleBufferDelegate(self, queue: self.audioQueue)
+            if self.session.canAddOutput(self.audioDataOutput) {
+                self.session.addOutput(self.audioDataOutput)
+            }
+
+            self.session.commitConfiguration()
+            self.isSessionConfigured = true
         }
 
-        // Salida de foto (para RAW .DNG y ráfaga 48MP 8K)
-        if session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
+        if let errMsg {
+            DispatchQueue.main.async {
+                self.statusBanner = "Error sesión: \(errMsg)"
+            }
+            return
         }
 
-        // Salida de muestras de video (para Open Gate 4032x3024 -> 8K Metal)
-        videoDataOutput.alwaysDiscardsLateVideoFrames = true
-        videoDataOutput.setSampleBufferDelegate(self, queue: videoQueue)
-        if session.canAddOutput(videoDataOutput) {
-            session.addOutput(videoDataOutput)
-        }
-
-        // Salida de muestras de audio
-        audioDataOutput.setSampleBufferDelegate(self, queue: audioQueue)
-        if session.canAddOutput(audioDataOutput) {
-            session.addOutput(audioDataOutput)
-        }
-
-        session.commitConfiguration()
         configureCameraFormatLocked()
-        session.startRunning()
+
+        _ = ObjCCatcher.catchException {
+            if !self.session.isRunning {
+                self.session.startRunning()
+            }
+        }
     }
 
     func reconfigureForMode() {
         sessionQueue.async { [weak self] in
-            guard let self, !self.isRecording else { return }
+            guard let self, self.isSessionConfigured, !self.isRecording else { return }
             self.configureCameraFormatLocked()
         }
     }
@@ -174,87 +209,100 @@ final class CameraEngine: NSObject, ObservableObject {
             return
         }
 
-        session.beginConfiguration()
-        if let oldInput = videoDeviceInput {
-            session.removeInput(oldInput)
-        }
-        if let newInput = try? AVCaptureDeviceInput(device: device), session.canAddInput(newInput) {
-            session.addInput(newInput)
-            videoDeviceInput = newInput
-        }
+        let errMsg = ObjCCatcher.catchException {
+            self.session.beginConfiguration()
 
-        do {
-            try device.lockForConfiguration()
-
-            switch mode {
-            case .rawPhoto, .video8KSensor48MP:
-                // Busca el formato que habilita los 48 MP (8064x6048) o el máximo disponible compatible con RAW
-                let bestFormat = selectBestPhotoFormat(for: device, requireRAW: mode == .rawPhoto)
-                if let bestFormat {
-                    device.activeFormat = bestFormat
-                    let maxDim = bestFormat.supportedMaxPhotoDimensions.max {
-                        Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
-                    }
-                    if let maxDim {
-                        photoOutput.maxPhotoDimensions = maxDim
-                    }
+            if self.videoDeviceInput?.device.uniqueID != device.uniqueID {
+                if let oldInput = self.videoDeviceInput {
+                    self.session.removeInput(oldInput)
                 }
-                photoOutput.maxPhotoQualityPrioritization = (mode == .video8KSensor48MP) ? .speed : .quality
-                if photoOutput.isAppleProRAWSupported {
-                    photoOutput.isAppleProRAWEnabled = (mode == .rawPhoto)
-                }
-
-            case .video8KFluid:
-                // Busca el formato de video de mayor resolución real (Open Gate 4032x3024 o 3840x2160 10-bit)
-                if let bestVideoFormat = selectBestOpenGateVideoFormat(for: device, desiredFPS: Double(targetFPS)) {
-                    device.activeFormat = bestVideoFormat
-                    let fps = clampFPS(Double(targetFPS), for: bestVideoFormat)
-                    let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
-                    device.activeVideoMinFrameDuration = dur
-                    device.activeVideoMaxFrameDuration = dur
+                if let newInput = try? AVCaptureDeviceInput(device: device), self.session.canAddInput(newInput) {
+                    self.session.addInput(newInput)
+                    self.videoDeviceInput = newInput
                 }
             }
 
-            let minI = device.activeFormat.minISO
-            let maxI = device.activeFormat.maxISO
-            let curISO = device.iso
-            let vDim = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-            let pDim = photoOutput.maxPhotoDimensions
-            let hasRAW = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
-
-            device.unlockForConfiguration()
-            session.commitConfiguration()
-
-            if let conn = videoDataOutput.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
-            }
-
-            DispatchQueue.main.async {
-                self.minISO = minI
-                self.maxISO = maxI
-                self.isoValue = min(max(curISO, minI), maxI)
-                self.rawSupportedOnCurrentLens = hasRAW
+            if (try? device.lockForConfiguration()) != nil {
                 switch self.mode {
-                case .rawPhoto:
-                    self.activeSensorFormatText = "SENSOR \(pDim.width)×\(pDim.height) • BAYER RAW \(hasRAW ? "ACTIVO" : "HEIC MAX")"
-                    self.statusBanner = hasRAW ? "RAW .DNG listo (\(pDim.width)×\(pDim.height))" : "RAW no disponible en este lente; usando máxima resolución"
+                case .rawPhoto, .video8KSensor48MP:
+                    if let bestFormat = self.selectBestPhotoFormat(for: device) {
+                        device.activeFormat = bestFormat
+                        let maxDim = bestFormat.supportedMaxPhotoDimensions.max {
+                            Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height)
+                        }
+                        if let maxDim, maxDim.width > 0 {
+                            _ = ObjCCatcher.catchException {
+                                self.photoOutput.maxPhotoDimensions = maxDim
+                            }
+                        }
+                    }
+                    _ = ObjCCatcher.catchException {
+                        self.photoOutput.maxPhotoQualityPrioritization = (self.mode == .video8KSensor48MP) ? .speed : .balanced
+                    }
+                    if self.photoOutput.isAppleProRAWSupported {
+                        _ = ObjCCatcher.catchException {
+                            self.photoOutput.isAppleProRAWEnabled = (self.mode == .rawPhoto)
+                        }
+                    }
+
                 case .video8KFluid:
-                    self.activeSensorFormatText = "ENTRADA \(vDim.width)×\(vDim.height) → SALIDA 8K 7680×4320 HEVC"
-                    self.statusBanner = "8K Fluido Metal GPU (\(self.targetFPS) fps) listo"
-                case .video8KSensor48MP:
-                    self.activeSensorFormatText = "SENSOR 48MP \(pDim.width)×\(pDim.height) → RECORTE 1:1 7680×4320"
-                    self.statusBanner = "8K Puro 48MP (estilo iPhone 5s) listo"
+                    if let bestVideoFormat = self.selectBestOpenGateVideoFormat(for: device, desiredFPS: Double(self.targetFPS)) {
+                        device.activeFormat = bestVideoFormat
+                        let fps = self.clampFPS(Double(self.targetFPS), for: bestVideoFormat)
+                        let dur = CMTime(value: 1, timescale: CMTimeScale(fps))
+                        _ = ObjCCatcher.catchException {
+                            device.activeVideoMinFrameDuration = dur
+                            device.activeVideoMaxFrameDuration = dur
+                        }
+                    }
+                }
+                device.unlockForConfiguration()
+            }
+
+            self.session.commitConfiguration()
+
+            if let conn = self.videoDataOutput.connection(with: .video) {
+                _ = ObjCCatcher.catchException {
+                    if conn.isVideoRotationAngleSupported(90) {
+                        conn.videoRotationAngle = 90
+                    }
                 }
             }
-        } catch {
-            session.commitConfiguration()
+        }
+
+        let minI = device.activeFormat.minISO
+        let maxI = device.activeFormat.maxISO
+        let curISO = device.iso
+        let vDim = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        let pDim = photoOutput.maxPhotoDimensions.width > 0 ? photoOutput.maxPhotoDimensions : vDim
+        let hasRAW = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
+
+        DispatchQueue.main.async {
+            self.minISO = minI
+            self.maxISO = maxI
+            self.isoValue = min(max(curISO, minI), maxI)
+            self.rawSupportedOnCurrentLens = hasRAW
+            if let errMsg {
+                self.statusBanner = "Aviso formato: \(errMsg)"
+                return
+            }
+            switch self.mode {
+            case .rawPhoto:
+                self.activeSensorFormatText = "SENSOR \(pDim.width)×\(pDim.height) • \(hasRAW ? "BAYER RAW .DNG" : "RAW 16-BIT .DNG/.TIFF")"
+                self.statusBanner = "RAW .DNG listo (\(pDim.width)×\(pDim.height))"
+            case .video8KFluid:
+                self.activeSensorFormatText = "ENTRADA \(vDim.width)×\(vDim.height) → SALIDA 8K 7680×4320 HEVC"
+                self.statusBanner = "8K Fluido Metal GPU (\(self.targetFPS) fps) listo"
+            case .video8KSensor48MP:
+                self.activeSensorFormatText = "SENSOR 48MP \(pDim.width)×\(pDim.height) → RECORTE 1:1 7680×4320"
+                self.statusBanner = "8K Puro 48MP (estilo iPhone 5s) listo"
+            }
         }
     }
 
-    private func selectBestPhotoFormat(for device: AVCaptureDevice, requireRAW: Bool) -> AVCaptureDevice.Format? {
+    private func selectBestPhotoFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
         let candidates = device.formats.filter { fmt in
             let sub = CMFormatDescriptionGetMediaSubType(fmt.formatDescription)
-            // Formatos 420f / 420v / x420 que soportan captura de alta resolución
             return sub == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
                 || sub == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                 || sub == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
@@ -263,7 +311,7 @@ final class CameraEngine: NSObject, ObservableObject {
             let maxA = a.supportedMaxPhotoDimensions.map { Int($0.width) * Int($0.height) }.max() ?? 0
             let maxB = b.supportedMaxPhotoDimensions.map { Int($0.width) * Int($0.height) }.max() ?? 0
             return maxA < maxB
-        }
+        } ?? device.formats.last
     }
 
     private func selectBestOpenGateVideoFormat(for device: AVCaptureDevice, desiredFPS: Double) -> AVCaptureDevice.Format? {
@@ -290,18 +338,20 @@ final class CameraEngine: NSObject, ObservableObject {
     func applyExposureSettings() {
         sessionQueue.async { [weak self] in
             guard let self, let device = self.videoDeviceInput?.device else { return }
-            guard (try? device.lockForConfiguration()) != nil else { return }
-            defer { device.unlockForConfiguration() }
+            _ = ObjCCatcher.catchException {
+                guard (try? device.lockForConfiguration()) != nil else { return }
+                defer { device.unlockForConfiguration() }
 
-            if self.manualExposure && device.isExposureModeSupported(.custom) {
-                let minDur = CMTimeGetSeconds(device.activeFormat.minExposureDuration)
-                let maxDur = min(CMTimeGetSeconds(device.activeFormat.maxExposureDuration), 0.5)
-                let clampedSec = min(max(self.shutterSeconds, minDur), maxDur)
-                let dur = CMTimeMakeWithSeconds(clampedSec, preferredTimescale: 1_000_000)
-                let clampedISO = min(max(self.isoValue, device.activeFormat.minISO), device.activeFormat.maxISO)
-                device.setExposureModeCustom(duration: dur, iso: clampedISO, completionHandler: nil)
-            } else if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
+                if self.manualExposure && device.isExposureModeSupported(.custom) {
+                    let minDur = CMTimeGetSeconds(device.activeFormat.minExposureDuration)
+                    let maxDur = min(CMTimeGetSeconds(device.activeFormat.maxExposureDuration), 0.5)
+                    let clampedSec = min(max(self.shutterSeconds, minDur), maxDur)
+                    let dur = CMTimeMakeWithSeconds(clampedSec, preferredTimescale: 1_000_000)
+                    let clampedISO = min(max(self.isoValue, device.activeFormat.minISO), device.activeFormat.maxISO)
+                    device.setExposureModeCustom(duration: dur, iso: clampedISO, completionHandler: nil)
+                } else if device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposureMode = .continuousAutoExposure
+                }
             }
         }
     }
@@ -309,13 +359,15 @@ final class CameraEngine: NSObject, ObservableObject {
     func applyFocusSettings() {
         sessionQueue.async { [weak self] in
             guard let self, let device = self.videoDeviceInput?.device else { return }
-            guard (try? device.lockForConfiguration()) != nil else { return }
-            defer { device.unlockForConfiguration() }
+            _ = ObjCCatcher.catchException {
+                guard (try? device.lockForConfiguration()) != nil else { return }
+                defer { device.unlockForConfiguration() }
 
-            if self.manualFocus && device.isLockingFocusWithCustomLensPositionSupported {
-                device.setFocusModeLocked(lensPosition: min(max(self.focusPosition, 0.0), 1.0), completionHandler: nil)
-            } else if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
+                if self.manualFocus && device.isLockingFocusWithCustomLensPositionSupported {
+                    device.setFocusModeLocked(lensPosition: min(max(self.focusPosition, 0.0), 1.0), completionHandler: nil)
+                } else if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
             }
         }
     }
@@ -340,20 +392,39 @@ final class CameraEngine: NSObject, ObservableObject {
             guard let self, !self.isCapturingPhoto else { return }
             DispatchQueue.main.async {
                 self.isCapturingPhoto = true
-                self.statusBanner = "Capturando Bayer RAW .DNG..."
+                self.statusBanner = "Capturando negativo RAW..."
             }
 
-            let settings: AVCapturePhotoSettings
-            if let rawFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first {
-                let processedFormat: [String: Any] = [AVVideoCodecKey: AVVideoCodecType.hevc]
-                settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat, processedFormat: processedFormat)
-            } else {
-                settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
-            }
-            settings.maxPhotoDimensions = self.photoOutput.maxPhotoDimensions
-            settings.photoQualityPrioritization = self.photoOutput.maxPhotoQualityPrioritization
+            let errMsg = ObjCCatcher.catchException {
+                let settings: AVCapturePhotoSettings
+                if let rawFormat = self.photoOutput.availableRawPhotoPixelFormatTypes.first {
+                    settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+                } else if self.photoOutput.availablePhotoPixelFormatTypes.contains(kCVPixelFormatType_32BGRA) {
+                    settings = AVCapturePhotoSettings(format: [
+                        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+                    ])
+                } else {
+                    settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
+                }
 
-            self.photoOutput.capturePhoto(with: settings, delegate: self)
+                if self.photoOutput.maxPhotoDimensions.width > 0 {
+                    _ = ObjCCatcher.catchException {
+                        settings.maxPhotoDimensions = self.photoOutput.maxPhotoDimensions
+                    }
+                }
+                _ = ObjCCatcher.catchException {
+                    settings.photoQualityPrioritization = self.photoOutput.maxPhotoQualityPrioritization
+                }
+
+                self.photoOutput.capturePhoto(with: settings, delegate: self)
+            }
+
+            if let errMsg {
+                DispatchQueue.main.async {
+                    self.isCapturingPhoto = false
+                    self.statusBanner = "Error al disparar: \(errMsg)"
+                }
+            }
         }
     }
 
@@ -373,7 +444,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
             let expectedFPS = (self.mode == .video8KFluid) ? self.targetFPS : (self.isTimelapsePacing48MP ? 30 : 18)
             let compressionProps: [String: Any] = [
-                AVVideoAverageBitRateKey: 120_000_000, // 120 Mbps para 8K limpio sin macrobloques
+                AVVideoAverageBitRateKey: 120_000_000,
                 AVVideoExpectedSourceFrameRateKey: expectedFPS,
                 AVVideoMaxKeyFrameIntervalKey: expectedFPS * 2,
                 AVVideoAllowFrameReorderingKey: false
@@ -386,47 +457,55 @@ final class CameraEngine: NSObject, ObservableObject {
                 AVVideoCompressionPropertiesKey: compressionProps
             ]
 
-            let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-            vInput.expectsMediaDataInRealTime = true
+            let errMsg = ObjCCatcher.catchException {
+                let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+                vInput.expectsMediaDataInRealTime = true
 
-            let sourceAttrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                kCVPixelBufferWidthKey as String: self.outWidth8K,
-                kCVPixelBufferHeightKey as String: self.outHeight8K,
-                kCVPixelBufferMetalCompatibilityKey as String: true,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: vInput,
-                sourcePixelBufferAttributes: sourceAttrs
-            )
-
-            if writer.canAdd(vInput) {
-                writer.add(vInput)
-            }
-
-            // Audio AAC de alta fidelidad (en modo 8K Fluido o 8K 48MP tiempo real)
-            if !self.isTimelapsePacing48MP {
-                let audioSettings: [String: Any] = [
-                    AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVSampleRateKey: 48_000,
-                    AVNumberOfChannelsKey: 2,
-                    AVEncoderBitRateKey: 256_000
+                let sourceAttrs: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                    kCVPixelBufferWidthKey as String: self.outWidth8K,
+                    kCVPixelBufferHeightKey as String: self.outHeight8K,
+                    kCVPixelBufferMetalCompatibilityKey as String: true,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
                 ]
-                let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-                aInput.expectsMediaDataInRealTime = true
-                if writer.canAdd(aInput) {
-                    writer.add(aInput)
-                    self.writerAudioInput = aInput
+                let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                    assetWriterInput: vInput,
+                    sourcePixelBufferAttributes: sourceAttrs
+                )
+
+                if writer.canAdd(vInput) {
+                    writer.add(vInput)
                 }
+
+                if !self.isTimelapsePacing48MP {
+                    let audioSettings: [String: Any] = [
+                        AVFormatIDKey: kAudioFormatMPEG4AAC,
+                        AVSampleRateKey: 48_000,
+                        AVNumberOfChannelsKey: 2,
+                        AVEncoderBitRateKey: 256_000
+                    ]
+                    let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                    aInput.expectsMediaDataInRealTime = true
+                    if writer.canAdd(aInput) {
+                        writer.add(aInput)
+                        self.writerAudioInput = aInput
+                    }
+                }
+
+                writer.startWriting()
+                self.assetWriter = writer
+                self.writerVideoInput = vInput
+                self.pixelBufferAdaptor = adaptor
+                self.recordingStartPTS = nil
+                self.burstFrameIndex = 0
             }
 
-            writer.startWriting()
-            self.assetWriter = writer
-            self.writerVideoInput = vInput
-            self.pixelBufferAdaptor = adaptor
-            self.recordingStartPTS = nil
-            self.burstFrameIndex = 0
+            if let errMsg {
+                DispatchQueue.main.async {
+                    self.statusBanner = "Error 8K HEVC: \(errMsg)"
+                }
+                return
+            }
 
             DispatchQueue.main.async {
                 self.isRecording = true
@@ -449,8 +528,10 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.statusBanner = "Cerrando archivo 8K .MOV..."
             }
 
-            self.writerVideoInput?.markAsFinished()
-            self.writerAudioInput?.markAsFinished()
+            _ = ObjCCatcher.catchException {
+                self.writerVideoInput?.markAsFinished()
+                self.writerAudioInput?.markAsFinished()
+            }
             let outputURL = writer.outputURL
 
             writer.finishWriting {
@@ -478,10 +559,18 @@ final class CameraEngine: NSObject, ObservableObject {
     // MARK: - Bucle de Ráfaga 48 MP -> 8K Puro (Método iPhone 5s / Vizzywig)
     private func captureNext48MPBurstFrame() {
         guard isRecording, mode == .video8KSensor48MP else { return }
-        let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
-        settings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
-        settings.photoQualityPrioritization = .speed
-        photoOutput.capturePhoto(with: settings, delegate: self)
+        _ = ObjCCatcher.catchException {
+            let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+            if self.photoOutput.maxPhotoDimensions.width > 0 {
+                _ = ObjCCatcher.catchException {
+                    settings.maxPhotoDimensions = self.photoOutput.maxPhotoDimensions
+                }
+            }
+            _ = ObjCCatcher.catchException {
+                settings.photoQualityPrioritization = .speed
+            }
+            self.photoOutput.capturePhoto(with: settings, delegate: self)
+        }
     }
 
     // MARK: - Procesamiento Metal GPU: Escalado Open Gate o Recorte 1:1 48MP a Buffer 8K (7680x4320)
@@ -490,8 +579,7 @@ final class CameraEngine: NSObject, ObservableObject {
               writer.status == .writing,
               let vInput = writerVideoInput,
               vInput.isReadyForMoreMediaData,
-              let adaptor = pixelBufferAdaptor,
-              let pool = adaptor.pixelBufferPool else {
+              let adaptor = pixelBufferAdaptor else {
             return
         }
 
@@ -500,6 +588,8 @@ final class CameraEngine: NSObject, ObservableObject {
             writer.startSession(atSourceTime: pts)
         }
 
+        guard let pool = adaptor.pixelBufferPool else { return }
+
         var outPixelBuffer: CVPixelBuffer?
         guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outPixelBuffer) == kCVReturnSuccess,
               let dstBuffer = outPixelBuffer else {
@@ -507,9 +597,8 @@ final class CameraEngine: NSObject, ObservableObject {
         }
 
         let extent = sourceImage.extent
-        let targetAspect = CGFloat(outWidth8K) / CGFloat(outHeight8K) // 16:9 = 1.7777
+        let targetAspect = CGFloat(outWidth8K) / CGFloat(outHeight8K)
 
-        // Recorte central 16:9 y ajuste exacto a 7680 x 4320 en GPU Metal
         let cropWidth: CGFloat
         let cropHeight: CGFloat
         if extent.width / extent.height > targetAspect {
@@ -537,7 +626,12 @@ final class CameraEngine: NSObject, ObservableObject {
 
         ciContext.render(scaled, to: dstBuffer, bounds: CGRect(x: 0, y: 0, width: outWidth8K, height: outHeight8K), colorSpace: CGColorSpace(name: CGColorSpace.displayP3))
 
-        if adaptor.append(dstBuffer, withPresentationTime: pts) {
+        var appended = false
+        _ = ObjCCatcher.catchException {
+            appended = adaptor.append(dstBuffer, withPresentationTime: pts)
+        }
+
+        if appended {
             let start = recordingStartPTS ?? pts
             let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(pts, start)))
             DispatchQueue.main.async {
@@ -556,7 +650,6 @@ final class CameraEngine: NSObject, ObservableObject {
             frameCounterWindow = 0
             fpsWindowStart = now
 
-            // Muestreo rápido de luminancia para el histograma en vivo
             CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
             var bins = [Float](repeating: 0, count: 32)
             if let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) {
@@ -612,7 +705,9 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
                   aInput.isReadyForMoreMediaData else {
                 return
             }
-            aInput.append(sampleBuffer)
+            _ = ObjCCatcher.catchException {
+                aInput.append(sampleBuffer)
+            }
         }
     }
 }
@@ -621,7 +716,6 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
 extension CameraEngine: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         if mode == .video8KSensor48MP && isRecording {
-            // Modo Ráfaga 48MP -> 8K estilo iPhone 5s
             if let data = photo.fileDataRepresentation(),
                let ciImg = CIImage(data: data)?.oriented(forExifOrientation: 6) {
                 let pts: CMTime
@@ -641,8 +735,20 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        // Modo Foto Bayer RAW (.DNG)
-        guard let data = photo.fileDataRepresentation() else {
+        // Modo Foto RAW (.DNG nativo o 16-bit sin comprimir)
+        var finalData: Data? = photo.fileDataRepresentation()
+        var ext = photo.isRawPhoto ? "DNG" : "TIFF"
+
+        if !photo.isRawPhoto, let pb = photo.pixelBuffer {
+            let ciImg = CIImage(cvPixelBuffer: pb).oriented(forExifOrientation: 6)
+            if let colorSpace = CGColorSpace(name: CGColorSpace.displayP3),
+               let tiffData = ciContext.tiffRepresentation(of: ciImg, format: .RGBA16, colorSpace: colorSpace, options: [:]) {
+                finalData = tiffData
+                ext = "TIFF"
+            }
+        }
+
+        guard let data = finalData else {
             DispatchQueue.main.async {
                 self.isCapturingPhoto = false
                 self.statusBanner = "Error en captura RAW: \(error?.localizedDescription ?? "sin datos")"
@@ -650,15 +756,13 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
             return
         }
 
-        let isRaw = photo.isRawPhoto
-        let ext = isRaw ? "DNG" : "HEIC"
         let filename = "IMG_\(Int(Date().timeIntervalSince1970))_RAW8K.\(ext)"
 
         PHPhotoLibrary.shared().performChanges({
             let req = PHAssetCreationRequest.forAsset()
             let opts = PHAssetResourceCreationOptions()
             opts.originalFilename = filename
-            req.addResource(with: isRaw ? .alternatePhoto : .photo, data: data, options: opts)
+            req.addResource(with: .photo, data: data, options: opts)
         }) { saved, err in
             DispatchQueue.main.async {
                 self.isCapturingPhoto = false

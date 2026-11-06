@@ -14,11 +14,25 @@ targets:
           - Info.plist
     info:
       path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Raw8KCam
+        UILaunchScreen: {}
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: "Raw8KCam necesita acceso directo al sensor de la cámara para capturar fotos en Bayer RAW (.DNG) y grabar video en 8K."
+        NSMicrophoneUsageDescription: "Raw8KCam necesita acceso al micrófono para grabar audio AAC de alta fidelidad junto con tus videos 8K."
+        NSPhotoLibraryUsageDescription: "Raw8KCam necesita acceso a tu fototeca para guardar y verificar tus archivos RAW (.DNG) y videos 8K (.MOV)."
+        NSPhotoLibraryAddUsageDescription: "Raw8KCam guarda directamente en tu carrete los negativos digitales .DNG y los videos 8K."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.angelortiz.raw8kcam
         PRODUCT_NAME: Raw8KCam
         SWIFT_VERSION: "5.9"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Camera/ObjCCatcher.h
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_IDENTITY: ""
         CODE_SIGNING_REQUIRED: NO
