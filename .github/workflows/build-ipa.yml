@@ -7,7 +7,11 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
@@ -38,5 +42,6 @@ jobs:
       - name: Subir Raw8KCam.ipa listo para Sideloadly / SideStore / AltStore
         uses: actions/upload-artifact@v4
         with:
-          name: Raw8KCam-IPA
+          name: Raw8KCam-IPA-${{ matrix.os }}
           path: Raw8KCam.ipa
+          overwrite: true
