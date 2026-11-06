@@ -11,55 +11,55 @@ import VideoToolbox
 
 enum CaptureMode: String, CaseIterable, Identifiable {
     case rawPhoto = "RAW 48MP"
-    case videoFluid = "CINE 9:16"
-    case videoOpenGate = "OPEN GATE 3:4"
+    case video8KFluid = "8K / 6K FLUIDO"
+    case video8KSensor48MP = "OPEN GATE PURO"
 
     var id: String { rawValue }
 
     var subtitle: String {
         switch self {
         case .rawPhoto:
-            return "Foto 48MP (8064×6048) sin Deep Fusion • Carrete + .DNG"
-        case .videoFluid:
-            return "Formato Vertical 9:16 • 24 / 30 / 60 FPS sin pérdida de cuadros"
-        case .videoOpenGate:
-            return "Sensor Completo 3:4 Open Gate sin recorte • 24 / 30 / 60 FPS"
+            return "Sensor 48MP completo (8064×6048) • Cero Deep Fusion (.DNG + Carrete)"
+        case .video8KFluid:
+            return "Formato Vertical 9:16 • Escalador Hardware Media Engine (24 / 30 / 60 FPS)"
+        case .video8KSensor48MP:
+            return "Sensor 4:3 Open Gate completo sin recorte EIS (24 / 30 / 60 FPS)"
         }
     }
 }
 
 enum VideoResolutionTier: String, CaseIterable, Identifiable {
-    case uhd8K = "8K UHD"
-    case pro6K = "6K PRO"
-    case native4KPlus = "4.3K DIRECTO"
+    case uhd8K = "8K"
+    case pro6K = "6K"
+    case native4K = "4.3K"
 
     var id: String { rawValue }
 
-    func targetLandscapeDimensions(isOpenGate4by3: Bool, sourceDim: CMVideoDimensions) -> (width: Int, height: Int) {
-        let w = Int(max(sourceDim.width, sourceDim.height))
-        let h = Int(min(sourceDim.width, sourceDim.height))
+    func dimensions(is4by3: Bool, source: CMVideoDimensions) -> (width: Int, height: Int) {
+        let w = Int(max(source.width, source.height))
+        let h = Int(min(source.width, source.height))
         switch self {
         case .uhd8K:
-            return isOpenGate4by3 ? (5760, 4320) : (7680, 4320)
+            return is4by3 ? (5760, 4320) : (7680, 4320)
         case .pro6K:
-            return isOpenGate4by3 ? (4800, 3600) : (5760, 3240)
-        case .native4KPlus:
+            return is4by3 ? (4800, 3600) : (5760, 3240)
+        case .native4K:
             return (max(w, 3840), max(h, 2160))
         }
     }
 
     var bitrate: Int {
         switch self {
-        case .uhd8K: return 110_000_000
-        case .pro6K: return 80_000_000
-        case .native4KPlus: return 55_000_000
+        case .uhd8K: return 68_000_000
+        case .pro6K: return 52_000_000
+        case .native4K: return 42_000_000
         }
     }
 }
 
 enum LensChoice: String, CaseIterable, Identifiable {
     case ultraWide = "0.5x"
-    case wide1x = "1x"
+    case wide1x = "1x 48M"
     case tele2x = "2x"
 
     var id: String { rawValue }
@@ -86,7 +86,7 @@ final class CameraEngine: NSObject, ObservableObject {
         didSet { reconfigureForMode() }
     }
     @Published var resolutionTier: VideoResolutionTier = .pro6K {
-        didSet { updateBannerForCurrentState() }
+        didSet { updateBannerText() }
     }
     @Published var lens: LensChoice = .wide1x {
         didSet { reconfigureForMode() }
@@ -95,17 +95,14 @@ final class CameraEngine: NSObject, ObservableObject {
         didSet { reconfigureForMode() }
     }
 
+    @Published var showFullSensorFrame: Bool = true
     @Published var showGridLines: Bool = true
     @Published var flashEffect: Bool = false
 
     @Published var isRecording: Bool = false
-    @Published var isMasteringVideo: Bool = false
-    @Published var masteringProgress: Double = 0.0
     @Published var isCapturingPhoto: Bool = false
     @Published var statusBanner: String = "Iniciando sensor..."
     @Published var activeSensorFormatText: String = "48MP 8064×6048"
-    // Aspect ratio vertical mostrado en pantalla (0.75 para 3:4, 0.5625 para 9:16)
-    @Published var viewfinderPortraitAspect: CGFloat = 3.0 / 4.0
     @Published var measuredFPS: Double = 60.0
     @Published var recordedFramesCount: Int = 0
     @Published var recordingElapsedSeconds: Double = 0.0
@@ -122,14 +119,13 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var shutterSeconds: Double = 1.0 / 120.0
     @Published var manualFocus: Bool = false
     @Published var focusPosition: Float = 0.5
-    @Published var histogramBins: [Float] = Array(repeating: 0.18, count: 28)
+    @Published var histogramBins: [Float] = Array(repeating: 0.15, count: 28)
 
     // MARK: - AVFoundation Core
     let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "com.raw8kcam.session", qos: .userInitiated)
-    private let videoQueue = DispatchQueue(label: "com.raw8kcam.videoOutput", qos: .userInteractive)
-    private let audioQueue = DispatchQueue(label: "com.raw8kcam.audioOutput", qos: .userInitiated)
-    private let masterQueue = DispatchQueue(label: "com.raw8kcam.mastering", qos: .userInitiated)
+    // Una sola cola serial para video + audio + AVAssetWriter: elimina al 100% cualquier crash al detener grabación
+    private let mediaWriterQueue = DispatchQueue(label: "com.raw8kcam.mediaWriter", qos: .userInteractive)
 
     private var isSessionConfigured = false
     private var videoDeviceInput: AVCaptureDeviceInput?
@@ -137,16 +133,17 @@ final class CameraEngine: NSObject, ObservableObject {
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let audioDataOutput = AVCaptureAudioDataOutput()
 
-    // Estado del formato activo del sensor
-    private var currentVideoDimensions = CMVideoDimensions(width: 3840, height: 2160)
-    private var currentPhotoDimensions = CMVideoDimensions(width: 8064, height: 6048)
-    private var currentActualFPS: Double = 60.0
+    private var activeVideoDim = CMVideoDimensions(width: 3840, height: 2160)
+    private var activePhotoDim = CMVideoDimensions(width: 8064, height: 6048)
+    private var activeFPS: Double = 60.0
 
-    // Grabador en Tiempo Real (Etapa 1: Captura 1:1 sin pérdida de cuadros)
+    // Estado interno del grabador (protegido exclusivamente por mediaWriterQueue)
+    private var isWriterActiveOnQueue: Bool = false
     private var assetWriter: AVAssetWriter?
     private var writerVideoInput: AVAssetWriterInput?
     private var writerAudioInput: AVAssetWriterInput?
     private var recordingStartPTS: CMTime?
+    private var localFrameCount: Int = 0
     private var frameCounterWindow: Int = 0
     private var fpsWindowStart: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
 
@@ -157,7 +154,7 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Permisos e Inicialización Secuencial
+    // MARK: - Permisos e Inicialización
     func requestPermissionsAndStart() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self else { return }
@@ -201,16 +198,17 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.session.addOutput(self.photoOutput)
             }
 
-            self.videoDataOutput.alwaysDiscardsLateVideoFrames = false
+            self.videoDataOutput.alwaysDiscardsLateVideoFrames = true
             self.videoDataOutput.videoSettings = [
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
             ]
-            self.videoDataOutput.setSampleBufferDelegate(self, queue: self.videoQueue)
+            self.videoDataOutput.setSampleBufferDelegate(self, queue: self.mediaWriterQueue)
             if self.session.canAddOutput(self.videoDataOutput) {
                 self.session.addOutput(self.videoDataOutput)
             }
 
-            self.audioDataOutput.setSampleBufferDelegate(self, queue: self.audioQueue)
+            // Ambos delegados en la misma cola serial mediaWriterQueue para evitar carreras de hilos al cerrar el archivo
+            self.audioDataOutput.setSampleBufferDelegate(self, queue: self.mediaWriterQueue)
             if self.session.canAddOutput(self.audioDataOutput) {
                 self.session.addOutput(self.audioDataOutput)
             }
@@ -237,12 +235,12 @@ final class CameraEngine: NSObject, ObservableObject {
 
     func reconfigureForMode() {
         sessionQueue.async { [weak self] in
-            guard let self, self.isSessionConfigured, !self.isRecording, !self.isMasteringVideo else { return }
+            guard let self, self.isSessionConfigured, !self.isRecording else { return }
             self.configureCameraFormatLocked()
         }
     }
 
-    // MARK: - Configuración Exacta de Formato del Sensor (0.5x, 1x, 2x | 24, 30, 60 FPS | 9:16 vs 3:4)
+    // MARK: - Selección de Formato Físico del Sensor
     private func configureCameraFormatLocked() {
         guard let device = AVCaptureDevice.default(lens.deviceType, for: .video, position: .back)
                 ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
@@ -297,7 +295,7 @@ final class CameraEngine: NSObject, ObservableObject {
                         }
                     }
 
-                case .videoFluid:
+                case .video8KFluid:
                     let desired = Double(self.targetFPS)
                     if let best16by9 = self.selectBestVideoFormat(for: device, desiredFPS: desired, prefer4by3: false) {
                         device.activeFormat = best16by9
@@ -309,7 +307,7 @@ final class CameraEngine: NSObject, ObservableObject {
                         }
                     }
 
-                case .videoOpenGate:
+                case .video8KSensor48MP:
                     let desired = Double(self.targetFPS)
                     if let best4by3 = self.selectBestVideoFormat(for: device, desiredFPS: desired, prefer4by3: true) {
                         device.activeFormat = best4by3
@@ -322,7 +320,6 @@ final class CameraEngine: NSObject, ObservableObject {
                     }
                 }
 
-                // Aplicar zoom 1x / 2x
                 let maxZ = min(device.activeFormat.videoMaxZoomFactor, 6.0)
                 let targetZ = min(max(self.lens.zoomFactor, 1.0), maxZ)
                 _ = ObjCCatcher.catchException {
@@ -342,21 +339,20 @@ final class CameraEngine: NSObject, ObservableObject {
 
             self.session.commitConfiguration()
 
-            // IMPORTANTE: NO rotamos físicamente los píxeles en videoDataOutput (evita caída de FPS).
-            // En su lugar, usamos CGAffineTransform(rotationAngle: .pi/2) en el contenedor .MOV.
+            // No rotamos píxeles en videoDataOutput; usamos vInput.transform = .pi/2 para 0% pérdida de rendimiento
             if let conn = self.videoDataOutput.connection(with: .video) {
                 _ = ObjCCatcher.catchException {
                     if conn.isVideoStabilizationSupported {
-                        conn.preferredVideoStabilizationMode = (self.mode == .videoOpenGate) ? .off : .standard
+                        conn.preferredVideoStabilizationMode = (self.mode == .video8KSensor48MP) ? .off : .standard
                     }
                 }
             }
         }
 
-        self.currentVideoDimensions = chosenVideoDim
+        self.activeVideoDim = chosenVideoDim
         let pDim = photoOutput.maxPhotoDimensions.width > 0 ? photoOutput.maxPhotoDimensions : chosenPhotoDim
-        self.currentPhotoDimensions = pDim
-        self.currentActualFPS = actualFPS
+        self.activePhotoDim = pDim
+        self.activeFPS = actualFPS
 
         let minI = device.activeFormat.minISO
         let maxI = device.activeFormat.maxISO
@@ -374,34 +370,30 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.statusBanner = "Aviso: \(errMsg)"
                 return
             }
-            self.updateBannerForCurrentState()
+            self.updateBannerText()
         }
     }
 
-    private func updateBannerForCurrentState() {
-        let pDim = currentPhotoDimensions
-        let vDim = currentVideoDimensions
-        let fpsInt = Int(round(currentActualFPS))
+    private func updateBannerText() {
+        let pDim = activePhotoDim
+        let vDim = activeVideoDim
+        let fpsInt = Int(round(activeFPS))
+        let hasRAW = rawSupportedOnCurrentLens
 
         switch mode {
         case .rawPhoto:
-            viewfinderPortraitAspect = 3.0 / 4.0
-            activeSensorFormatText = "RAW \(pDim.width)×\(pDim.height) • 3:4"
+            activeSensorFormatText = "\(pDim.width)×\(pDim.height) • \(hasRAW ? "BAYER .DNG" : "RAW .DNG + 48MP")"
             statusBanner = "Sensor \(pDim.width)×\(pDim.height) listo (Cero Deep Fusion)"
-        case .videoFluid:
-            viewfinderPortraitAspect = 9.0 / 16.0
-            let out = resolutionTier.targetLandscapeDimensions(isOpenGate4by3: false, sourceDim: vDim)
-            // En vertical se guarda como height x width (ej. 4320x7680 o 3240x5760)
-            activeSensorFormatText = "\(resolutionTier.rawValue) \(out.height)×\(out.width) • \(fpsInt) FPS"
+        case .video8KFluid:
+            let out = resolutionTier.dimensions(is4by3: false, source: vDim)
+            activeSensorFormatText = "\(vDim.height)×\(vDim.width) → \(resolutionTier.rawValue) \(out.height)×\(out.width) (\(fpsInt) FPS)"
             statusBanner = "\(resolutionTier.rawValue) Vertical 9:16 a \(fpsInt) FPS listo"
-        case .videoOpenGate:
-            let w = CGFloat(max(vDim.width, vDim.height))
-            let h = CGFloat(min(vDim.width, vDim.height))
-            viewfinderPortraitAspect = h / max(w, 1)
-            let is4by3 = abs((w / max(h, 1)) - (4.0 / 3.0)) < 0.12
-            let out = resolutionTier.targetLandscapeDimensions(isOpenGate4by3: is4by3, sourceDim: vDim)
-            activeSensorFormatText = "OPEN GATE \(out.height)×\(out.width) • \(fpsInt) FPS"
-            statusBanner = "Open Gate Completo a \(fpsInt) FPS sin recorte listo"
+        case .video8KSensor48MP:
+            let ratio = Double(max(vDim.width, vDim.height)) / Double(max(min(vDim.width, vDim.height), 1))
+            let is4by3 = abs(ratio - (4.0 / 3.0)) < 0.12
+            let out = resolutionTier.dimensions(is4by3: is4by3, source: vDim)
+            activeSensorFormatText = "OPEN GATE \(vDim.height)×\(vDim.width) → \(out.height)×\(out.width)"
+            statusBanner = "\(resolutionTier.rawValue) Open Gate (\(fpsInt) FPS sin recorte) listo"
         }
     }
 
@@ -443,7 +435,6 @@ final class CameraEngine: NSObject, ObservableObject {
             return isYUV && vDim.width >= 1920
         }
 
-        // Primero intentamos con los formatos que soportan el FPS pedido (ej. 60, 30 o 24)
         let fpsMatching = allYUV.filter { fmt in
             fmt.videoSupportedFrameRateRanges.contains { $0.maxFrameRate + 0.5 >= desiredFPS }
         }
@@ -460,14 +451,12 @@ final class CameraEngine: NSObject, ObservableObject {
             let is16by9B = abs(ratioB - (16.0 / 9.0)) < 0.09
 
             if prefer4by3 {
-                // En Open Gate preferimos 4:3 de alta resolución (>= 2800 px ancho)
                 let high4by3A = is4by3A && da.width >= 2800
                 let high4by3B = is4by3B && db.width >= 2800
                 if high4by3A != high4by3B {
                     return !high4by3A && high4by3B
                 }
             } else {
-                // En Cine 9:16 obligamos a elegir 16:9 (3840x2160) para que 0.5x y 1x jamás cambien a otro formato
                 if is16by9A != is16by9B {
                     return !is16by9A && is16by9B
                 }
@@ -489,7 +478,7 @@ final class CameraEngine: NSObject, ObservableObject {
         return min(max(fps, range.minFrameRate), range.maxFrameRate)
     }
 
-    // MARK: - Tap-to-Focus & Exposición en el Visor
+    // MARK: - Tap-to-Focus & Exposición
     func focusAndExpose(at normalizedPoint: CGPoint, viewPoint: CGPoint) {
         DispatchQueue.main.async {
             self.focusTapPoint = viewPoint
@@ -557,28 +546,27 @@ final class CameraEngine: NSObject, ObservableObject {
 
     // MARK: - Acción Principal del Obturador
     func triggerPrimaryAction() {
-        guard !isMasteringVideo else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         switch mode {
         case .rawPhoto:
             shootRawPhoto()
-        case .videoFluid, .videoOpenGate:
+        case .video8KFluid, .video8KSensor48MP:
             if isRecording {
-                stopRecordingAndMaster()
+                stop8KRecording()
             } else {
-                startZeroDropRecording()
+                start8KRecording()
             }
         }
     }
 
-    // MARK: - Modo 1: Disparo Fotográfico 48MP "Process Zero" (Sin Deep Fusion) + .DNG Real
+    // MARK: - Modo 1: Disparo Fotográfico 48MP "Process Zero" + .DNG Real
     private func shootRawPhoto() {
         sessionQueue.async { [weak self] in
             guard let self, !self.isCapturingPhoto else { return }
             DispatchQueue.main.async {
                 self.isCapturingPhoto = true
                 self.flashEffect = true
-                self.statusBanner = "Capturando 48MP sin Deep Fusion..."
+                self.statusBanner = "Capturando sensor completo..."
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
                     self.flashEffect = false
                 }
@@ -613,45 +601,53 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Etapa 1: Captura en Tiempo Real 1:1 con CERO Caída de FPS y Orientación Vertical Exacta
-    private func startZeroDropRecording() {
-        sessionQueue.async { [weak self] in
-            guard let self, !self.isRecording, !self.isMasteringVideo else { return }
+    // MARK: - Modos 2 y 3: Grabación Directa 8K / 6K / 4.3K en Hardware Media Engine (Thread-Safe en mediaWriterQueue)
+    private func start8KRecording() {
+        let tier = self.resolutionTier
+        let currentMode = self.mode
+        let vDim = self.activeVideoDim
+        let expectedFPS = Int(round(self.activeFPS))
 
-            let tempDir = FileManager.default.temporaryDirectory
-            let rawMasterURL = tempDir.appendingPathComponent("MasterZeroDrop_\(Int(Date().timeIntervalSince1970)).mov")
-            try? FileManager.default.removeItem(at: rawMasterURL)
+        mediaWriterQueue.async { [weak self] in
+            guard let self, !self.isWriterActiveOnQueue else { return }
 
-            guard let writer = try? AVAssetWriter(outputURL: rawMasterURL, fileType: .mov) else {
+            let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            let outputURL = docsDir.appendingPathComponent("Raw8K_\(tier.rawValue)_\(Int(Date().timeIntervalSince1970)).mov")
+            try? FileManager.default.removeItem(at: outputURL)
+
+            guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else {
                 DispatchQueue.main.async { self.statusBanner = "Error al crear contenedor .MOV" }
                 return
             }
 
-            let srcW = Int(max(self.currentVideoDimensions.width, 1920))
-            let srcH = Int(max(self.currentVideoDimensions.height, 1080))
-            let fps = Int(round(self.currentActualFPS))
+            let ratio = Double(max(vDim.width, vDim.height)) / Double(max(min(vDim.width, vDim.height), 1))
+            let is4by3 = (currentMode == .video8KSensor48MP) && abs(ratio - (4.0 / 3.0)) < 0.12
+            let outDim = tier.dimensions(is4by3: is4by3, source: vDim)
 
-            // En la Etapa 1 grabamos a la resolución nativa exacta del sensor (3840x2160 o 4032x3024)
-            // con RealTime=true y sin rotación física de píxeles -> 0% cuadros perdidos a 24, 30 o 60 FPS!
+            // Configuración de baja latencia en tiempo real para el Hardware Media Engine del A18:
+            // PrioritizeEncodingSpeedOverQuality + RealTime evita que caigan los FPS después de 2 segundos
             let compressionProps: [String: Any] = [
-                AVVideoAverageBitRateKey: 65_000_000,
-                AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoMaxKeyFrameIntervalKey: fps * 2,
+                AVVideoAverageBitRateKey: tier.bitrate,
+                AVVideoExpectedSourceFrameRateKey: expectedFPS,
+                AVVideoMaxKeyFrameIntervalKey: expectedFPS * 2,
                 AVVideoAllowFrameReorderingKey: false,
-                kVTCompressionPropertyKey_RealTime as String: true
+                kVTCompressionPropertyKey_RealTime as String: true,
+                kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String: true
             ]
 
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.hevc,
-                AVVideoWidthKey: srcW,
-                AVVideoHeightKey: srcH,
+                AVVideoWidthKey: outDim.width,
+                AVVideoHeightKey: outDim.height,
+                AVVideoScalingModeKey: AVVideoScalingModeResizeAspectFill,
                 AVVideoCompressionPropertiesKey: compressionProps
             ]
 
             let errMsg = ObjCCatcher.catchException {
                 let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
                 vInput.expectsMediaDataInRealTime = true
-                // Matriz de rotación vertical (90°) de costo cero en el encabezado del .MOV
+                // Rotación vertical (90°) en metadatos del .MOV: se guarda en vertical exacto sin gastar RAM rotando píxeles
                 vInput.transform = CGAffineTransform(rotationAngle: .pi / 2)
 
                 if writer.canAdd(vInput) {
@@ -675,11 +671,13 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.assetWriter = writer
                 self.writerVideoInput = vInput
                 self.recordingStartPTS = nil
+                self.localFrameCount = 0
+                self.isWriterActiveOnQueue = true
             }
 
             if let errMsg {
                 DispatchQueue.main.async {
-                    self.statusBanner = "Error grabador: \(errMsg)"
+                    self.statusBanner = "Error codificador: \(errMsg)"
                 }
                 return
             }
@@ -688,230 +686,69 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.isRecording = true
                 self.recordedFramesCount = 0
                 self.recordingElapsedSeconds = 0
-                self.statusBanner = "GRABANDO \(self.resolutionTier.rawValue) • \(fps) FPS SIN PÉRDIDA..."
+                self.statusBanner = "GRABANDO \(tier.rawValue) (\(outDim.height)×\(outDim.width) • \(expectedFPS) FPS)..."
             }
         }
     }
 
-    // MARK: - Etapa 2: Cierre y Masterización Pull-Mode a 6K / 8K sin Congelamientos
-    private func stopRecordingAndMaster() {
-        sessionQueue.async { [weak self] in
-            guard let self, self.isRecording, let writer = self.assetWriter else { return }
+    private func stop8KRecording() {
+        // Ejecutado en la misma cola serial mediaWriterQueue donde corren los delegados de video y audio:
+        // jamás puede ocurrir un crash por condición de carrera entre append() y finishWriting()
+        mediaWriterQueue.async { [weak self] in
+            guard let self, self.isWriterActiveOnQueue, let writer = self.assetWriter else { return }
 
-            let tier = self.resolutionTier
-            let isOpenGate = (self.mode == .videoOpenGate)
-            let srcDim = self.currentVideoDimensions
-            let fps = Int(round(self.currentActualFPS))
+            // Desactivar inmediatamente en la misma cola antes de cerrar las entradas
+            self.isWriterActiveOnQueue = false
+            let finalFrames = self.localFrameCount
+            let vIn = self.writerVideoInput
+            let aIn = self.writerAudioInput
+            let hasStartedSession = (self.recordingStartPTS != nil)
+
+            self.writerVideoInput = nil
+            self.writerAudioInput = nil
+            self.assetWriter = nil
+            self.recordingStartPTS = nil
 
             DispatchQueue.main.async {
                 self.isRecording = false
-                self.statusBanner = "Cerrando captura en tiempo real..."
+                self.statusBanner = "Guardando video en Fotos..."
             }
 
-            _ = ObjCCatcher.catchException {
-                self.writerVideoInput?.markAsFinished()
-                self.writerAudioInput?.markAsFinished()
-            }
-            let masterURL = writer.outputURL
-
-            writer.finishWriting {
-                self.assetWriter = nil
-                self.writerVideoInput = nil
-                self.writerAudioInput = nil
-
-                // Si el usuario eligió 4.3K DIRECTO, se guarda al instante sin espera
-                if tier == .native4KPlus {
-                    self.saveVideoFileToPhotosAndFiles(sourceURL: masterURL, label: "4.3K Directo (\(fps) FPS)")
-                    return
+            guard hasStartedSession, writer.status == .writing else {
+                _ = ObjCCatcher.catchException {
+                    writer.cancelWriting()
                 }
-
-                // Si eligió 6K PRO u 8K UHD, escalamos con AVAssetReader (Pull-Mode) para conservar el 100% de los FPS sin congelamientos
-                let ratio = Double(max(srcDim.width, srcDim.height)) / Double(max(min(srcDim.width, srcDim.height), 1))
-                let is4by3 = isOpenGate && abs(ratio - (4.0 / 3.0)) < 0.12
-                let target = tier.targetLandscapeDimensions(isOpenGate4by3: is4by3, sourceDim: srcDim)
-
-                self.runOfflineHardwareUpscale(
-                    sourceURL: masterURL,
-                    targetWidth: target.width,
-                    targetHeight: target.height,
-                    bitrate: tier.bitrate,
-                    fps: fps,
-                    tierName: tier.rawValue
-                )
-            }
-        }
-    }
-
-    private func runOfflineHardwareUpscale(
-        sourceURL: URL,
-        targetWidth: Int,
-        targetHeight: Int,
-        bitrate: Int,
-        fps: Int,
-        tierName: String
-    ) {
-        DispatchQueue.main.async {
-            self.isMasteringVideo = true
-            self.masteringProgress = 0.05
-            self.statusBanner = "Masterizando \(tierName) (\(targetHeight)×\(targetWidth)) sin perder FPS..."
-        }
-
-        masterQueue.async { [weak self] in
-            guard let self else { return }
-            let asset = AVURLAsset(url: sourceURL)
-            let durationSec = max(CMTimeGetSeconds(asset.duration), 0.1)
-
-            let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-                ?? FileManager.default.temporaryDirectory
-            let finalURL = docsDir.appendingPathComponent("Raw8K_\(tierName.replacingOccurrences(of: " ", with: ""))_\(Int(Date().timeIntervalSince1970)).mov")
-            try? FileManager.default.removeItem(at: finalURL)
-
-            guard let reader = try? AVAssetReader(asset: asset),
-                  let writer = try? AVAssetWriter(outputURL: finalURL, fileType: .mov),
-                  let videoTrack = asset.tracks(withMediaType: .video).first else {
-                // Fallback seguro: guardar el master directo sin perder el video
-                self.saveVideoFileToPhotosAndFiles(sourceURL: sourceURL, label: "Master Directo")
+                DispatchQueue.main.async {
+                    self.statusBanner = "Grabación demasiado corta"
+                }
                 return
             }
 
-            let readerVideoSettings: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-            ]
-            let readerVideoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerVideoSettings)
-            readerVideoOutput.alwaysCopiesSampleData = false
-            if reader.canAdd(readerVideoOutput) {
-                reader.add(readerVideoOutput)
+            _ = ObjCCatcher.catchException {
+                vIn?.markAsFinished()
+                aIn?.markAsFinished()
             }
 
-            let compressionProps: [String: Any] = [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoMaxKeyFrameIntervalKey: fps * 2,
-                AVVideoAllowFrameReorderingKey: false
-            ]
-            let writerVideoSettings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.hevc,
-                AVVideoWidthKey: targetWidth,
-                AVVideoHeightKey: targetHeight,
-                AVVideoScalingModeKey: AVVideoScalingModeResizeAspectFill,
-                AVVideoCompressionPropertiesKey: compressionProps
-            ]
-            let writerVideoInput = AVAssetWriterInput(mediaType: .video, outputSettings: writerVideoSettings)
-            writerVideoInput.expectsMediaDataInRealTime = false
-            writerVideoInput.transform = videoTrack.preferredTransform
-            if writer.canAdd(writerVideoInput) {
-                writer.add(writerVideoInput)
-            }
-
-            var readerAudioOutput: AVAssetReaderTrackOutput?
-            var writerAudioInput: AVAssetWriterInput?
-            if let audioTrack = asset.tracks(withMediaType: .audio).first {
-                let aOut = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                if reader.canAdd(aOut) {
-                    reader.add(aOut)
-                    readerAudioOutput = aOut
-                }
-                let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
-                aIn.expectsMediaDataInRealTime = false
-                if writer.canAdd(aIn) {
-                    writer.add(aIn)
-                    writerAudioInput = aIn
-                }
-            }
-
-            reader.startReading()
-            writer.startWriting()
-            writer.startSession(atSourceTime: .zero)
-
-            let group = DispatchGroup()
-
-            group.enter()
-            let vQueue = DispatchQueue(label: "com.raw8kcam.upscale.video")
-            writerVideoInput.requestMediaDataWhenReady(on: vQueue) {
-                while writerVideoInput.isReadyForMoreMediaData {
-                    if let sb = readerVideoOutput.copyNextSampleBuffer() {
-                        let pts = CMSampleBufferGetPresentationTimeStamp(sb)
-                        let prog = min(0.98, max(0.05, CMTimeGetSeconds(pts) / durationSec))
-                        DispatchQueue.main.async {
-                            self.masteringProgress = prog
-                            self.statusBanner = String(format: "Masterizando %@ (%dx%d): %.0f%%", tierName, targetHeight, targetWidth, prog * 100)
-                        }
-                        _ = ObjCCatcher.catchException {
-                            _ = writerVideoInput.append(sb)
-                        }
-                    } else {
-                        writerVideoInput.markAsFinished()
-                        group.leave()
-                        break
-                    }
-                }
-            }
-
-            if let aOut = readerAudioOutput, let aIn = writerAudioInput {
-                group.enter()
-                let aQueue = DispatchQueue(label: "com.raw8kcam.upscale.audio")
-                aIn.requestMediaDataWhenReady(on: aQueue) {
-                    while aIn.isReadyForMoreMediaData {
-                        if let sb = aOut.copyNextSampleBuffer() {
-                            _ = ObjCCatcher.catchException {
-                                _ = aIn.append(sb)
-                            }
+            let outputURL = writer.outputURL
+            writer.finishWriting {
+                PHPhotoLibrary.shared().performChanges({
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)
+                }) { saved, err in
+                    DispatchQueue.main.async {
+                        self.lastCapturedFileURL = outputURL
+                        if saved {
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            self.statusBanner = "Video guardado en Fotos y Archivos (\(finalFrames) cuadros)"
                         } else {
-                            aIn.markAsFinished()
-                            group.leave()
-                            break
+                            self.statusBanner = "Guardado en Archivos (\(err?.localizedDescription ?? ""))"
                         }
                     }
                 }
             }
-
-            group.notify(queue: self.masterQueue) {
-                writer.finishWriting {
-                    if writer.status == .completed {
-                        try? FileManager.default.removeItem(at: sourceURL)
-                        self.saveVideoFileToPhotosAndFiles(
-                            sourceURL: finalURL,
-                            label: "\(tierName) \(targetHeight)×\(targetWidth) (\(fps) FPS)"
-                        )
-                    } else {
-                        // Si algo falló en el reescalado, guardamos el master original sin perder la grabación
-                        self.saveVideoFileToPhotosAndFiles(sourceURL: sourceURL, label: "Master \(fps) FPS")
-                    }
-                }
-            }
         }
     }
 
-    private func saveVideoFileToPhotosAndFiles(sourceURL: URL, label: String) {
-        let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        let destURL: URL
-        if sourceURL.path.hasPrefix(docsDir.path) {
-            destURL = sourceURL
-        } else {
-            destURL = docsDir.appendingPathComponent(sourceURL.lastPathComponent)
-            try? FileManager.default.removeItem(at: destURL)
-            try? FileManager.default.moveItem(at: sourceURL, to: destURL)
-        }
-
-        PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: destURL)
-        }) { saved, err in
-            DispatchQueue.main.async {
-                self.isMasteringVideo = false
-                self.masteringProgress = 0.0
-                self.lastCapturedFileURL = destURL
-                if saved {
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    self.statusBanner = "Guardado \(label) en Fotos"
-                } else {
-                    self.statusBanner = "Guardado en Archivos (\(err?.localizedDescription ?? label))"
-                }
-            }
-        }
-    }
-
-    // MARK: - Telemetría Ligera sin Bloquear la Captura
+    // MARK: - Telemetría Ligera
     private func updateTelemetryAndHistogram(from pixelBuffer: CVPixelBuffer) {
         let now = CFAbsoluteTimeGetCurrent()
         frameCounterWindow += 1
@@ -922,7 +759,7 @@ final class CameraEngine: NSObject, ObservableObject {
         frameCounterWindow = 0
         fpsWindowStart = now
 
-        if isRecording {
+        if isWriterActiveOnQueue {
             DispatchQueue.main.async {
                 self.measuredFPS = fps
             }
@@ -962,7 +799,7 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 }
 
-// MARK: - Delegado de Video y Audio Zero-Drop
+// MARK: - Delegado de Video y Audio Serializado en mediaWriterQueue
 extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output === videoDataOutput {
@@ -970,7 +807,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
                 updateTelemetryAndHistogram(from: pb)
             }
 
-            guard isRecording,
+            guard isWriterActiveOnQueue,
                   let writer = assetWriter,
                   writer.status == .writing,
                   let vInput = writerVideoInput,
@@ -990,15 +827,17 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
             }
 
             if appended {
+                localFrameCount += 1
+                let count = localFrameCount
                 let start = recordingStartPTS ?? pts
                 let elapsed = max(0, CMTimeGetSeconds(CMTimeSubtract(pts, start)))
                 DispatchQueue.main.async {
-                    self.recordedFramesCount += 1
+                    self.recordedFramesCount = count
                     self.recordingElapsedSeconds = elapsed
                 }
             }
         } else if output === audioDataOutput {
-            guard isRecording,
+            guard isWriterActiveOnQueue,
                   let writer = assetWriter,
                   writer.status == .writing,
                   recordingStartPTS != nil,
@@ -1007,13 +846,13 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureA
                 return
             }
             _ = ObjCCatcher.catchException {
-                aInput.append(sampleBuffer)
+                _ = aInput.append(sampleBuffer)
             }
         }
     }
 }
 
-// MARK: - Delegado de Captura Fotográfica: Guardado 100% Seguro en Carrete + Exportación .DNG en Archivos
+// MARK: - Delegado de Captura Fotográfica: Guardado en Carrete + .DNG en Archivos
 extension CameraEngine: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         guard let rawOrCompressedData = photo.fileDataRepresentation() else {

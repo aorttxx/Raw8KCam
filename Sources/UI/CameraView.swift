@@ -2,64 +2,10 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
-// MARK: - Modificador de Material "Liquid Glass" (Inspirado en Vidrio.tendies)
-struct LiquidGlassModifier: ViewModifier {
-    var cornerRadius: CGFloat = 20
-    var tintColor: Color = .cyan
-    var isHighlighted: Bool = false
-
-    func body(content: Content) -> some View {
-        content
-            .background(
-                ZStack {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(.ultraThinMaterial)
-
-                    // Refracción cáustica diagonal tipo lente de vidrio líquido
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(isHighlighted ? 0.34 : 0.18),
-                                    tintColor.opacity(isHighlighted ? 0.28 : 0.08),
-                                    Color.clear,
-                                    Color(red: 0.55, green: 0.38, blue: 1.0).opacity(0.12)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                }
-            )
-            .overlay(
-                // Borde especular de cristal (brillo intenso arriba/izquierda y reflejo frío abajo/derecha)
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(isHighlighted ? 0.90 : 0.62),
-                                Color.white.opacity(0.12),
-                                tintColor.opacity(isHighlighted ? 0.65 : 0.32)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: isHighlighted ? 1.5 : 1.0
-                    )
-            )
-            .shadow(color: Color.black.opacity(0.42), radius: 12, x: 0, y: 6)
-    }
-}
-
-extension View {
-    func liquidGlass(cornerRadius: CGFloat = 20, tint: Color = .cyan, highlighted: Bool = false) -> some View {
-        modifier(LiquidGlassModifier(cornerRadius: cornerRadius, tintColor: tint, isHighlighted: highlighted))
-    }
-}
-
-// MARK: - Visor Nativo AVCaptureVideoPreviewLayer Sincronizado con el Formato Guardado
+// MARK: - Visor Nativo AVCaptureVideoPreviewLayer (Soporta 100% Sensor Completo o Pantalla Llena)
 struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
+    let showFullSensorFrame: Bool
     let onTapFocus: (CGPoint, CGPoint) -> Void
 
     final class VideoPreviewUIView: UIView {
@@ -78,7 +24,7 @@ struct CameraPreviewView: UIViewRepresentable {
         let v = VideoPreviewUIView()
         v.backgroundColor = .black
         v.previewLayer.session = session
-        v.previewLayer.videoGravity = .resizeAspectFill
+        v.previewLayer.videoGravity = showFullSensorFrame ? .resizeAspect : .resizeAspectFill
         let tap = UITapGestureRecognizer(target: v, action: #selector(VideoPreviewUIView.handleTap(_:)))
         v.addGestureRecognizer(tap)
         v.tapHandler = onTapFocus
@@ -86,11 +32,18 @@ struct CameraPreviewView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: VideoPreviewUIView, context: Context) {
+        let targetGravity: AVLayerVideoGravity = showFullSensorFrame ? .resizeAspect : .resizeAspectFill
+        if uiView.previewLayer.videoGravity != targetGravity {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.22)
+            uiView.previewLayer.videoGravity = targetGravity
+            CATransaction.commit()
+        }
         uiView.tapHandler = onTapFocus
     }
 }
 
-// MARK: - Hoja Nativa de Compartir (.DNG / .MOV 8K / 6K)
+// MARK: - Hoja Nativa de Compartir (.DNG / .MOV 8K)
 struct ShareSheetView: UIViewControllerRepresentable {
     let items: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -125,114 +78,82 @@ struct CameraView: View {
 
     var body: some View {
         ZStack {
-            // Fondo ambiental oscuro con reflejos cáusticos tipo Vidrio.tendies
-            ZStack {
-                Color(red: 0.03, green: 0.04, blue: 0.07)
-                Circle()
-                    .fill(accentColor.opacity(0.14))
-                    .frame(width: 320, height: 320)
-                    .blur(radius: 75)
-                    .offset(x: -110, y: -240)
-                Circle()
-                    .fill(Color(red: 0.45, green: 0.25, blue: 0.95).opacity(0.14))
-                    .frame(width: 300, height: 300)
-                    .blur(radius: 80)
-                    .offset(x: 120, y: 240)
-            }
-            .ignoresSafeArea()
+            Color.black.ignoresSafeArea()
 
-            VStack(spacing: 8) {
-                // 1. Cápsula Superior Liquid Glass (Telemetría + Histograma + FPS)
-                topLiquidGlassHUD
+            VStack(spacing: 0) {
+                // 1. Barra Superior Pro (Telemetría + Histograma + Conmutador 100% Sensor)
+                topProBar
                     .padding(.horizontal, 12)
-                    .padding(.top, 2)
+                    .padding(.top, 4)
+                    .padding(.bottom, 6)
 
-                // 2. Visor con Proporción Exacta (3:4 o 9:16 idéntica al video/foto guardado)
-                GeometryReader { geo in
-                    let availW = geo.size.width
-                    let availH = geo.size.height
-                    let aspect = engine.viewfinderPortraitAspect // 0.75 (3:4) o 0.5625 (9:16)
-                    let fitH = min(availH, availW / aspect)
-                    let fitW = min(availW, fitH * aspect)
-
-                    ZStack {
-                        // Marco exacto de captura (lo que ves aquí es 100% idéntico a lo que se guarda)
-                        ZStack {
-                            CameraPreviewView(session: engine.session) { devPt, viewPt in
-                                engine.focusAndExpose(at: devPt, viewPoint: viewPt)
-                            }
-                            .frame(width: fitW, height: fitH)
-                            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-
-                            // Rejilla óptica de tercios y borde especular Liquid Glass
-                            viewfinderGlassOverlay(width: fitW, height: fitH)
-
-                            // Destello de obturador al capturar RAW
-                            if engine.flashEffect {
-                                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                    .fill(Color.white.opacity(0.6))
-                                    .frame(width: fitW, height: fitH)
-                                    .allowsHitTesting(false)
-                            }
-
-                            // Retícula de enfoque Liquid Glass al tocar
-                            if let pt = engine.focusTapPoint {
-                                focusGlassOrb
-                                    .position(pt)
-                                    .onAppear {
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
-                                            withAnimation(.easeOut(duration: 0.25)) {
-                                                engine.focusTapPoint = nil
-                                            }
-                                        }
-                                    }
-                            }
-
-                            // Overlay de Masterización 8K / 6K sin pérdida de FPS
-                            if engine.isMasteringVideo {
-                                masteringGlassOverlay
-                            }
-
-                            // Píldora flotante de Lentes (0.5x • 1x • 2x) en vidrio líquido
-                            VStack {
-                                Spacer()
-                                lensLiquidGlassDock
-                                    .padding(.bottom, 12)
-                            }
-                            .frame(width: fitW, height: fitH)
-                        }
-                        .frame(width: fitW, height: fitH)
-                        .animation(.spring(response: 0.32, dampingFraction: 0.82), value: engine.viewfinderPortraitAspect)
+                // 2. Visor de Cámara con Marco de Sensor Completo (4:3 o 16:9) sin recortar
+                ZStack {
+                    CameraPreviewView(
+                        session: engine.session,
+                        showFullSensorFrame: engine.showFullSensorFrame
+                    ) { devPt, viewPt in
+                        engine.focusAndExpose(at: devPt, viewPoint: viewPt)
                     }
-                    .frame(width: availW, height: availH)
-                }
-                .padding(.horizontal, 8)
+                    .clipShape(RoundedRectangle(cornerRadius: engine.showFullSensorFrame ? 14 : 0))
 
-                // 3. Barra de Resolución (8K / 6K / 4.3K) y Cadencia (24 / 30 / 60 FPS) en modos de video
-                if engine.mode != .rawPhoto {
-                    videoResolutionAndFPSGlassBar
-                        .padding(.horizontal, 12)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
+                    // Guías ópticas de encuadre y esquinas de cine
+                    viewfinderOverlay
 
-                // 4. Cajón Desplegable Liquid Glass para ISO / Obturador / Enfoque Manual
+                    // Efecto de obturador al disparar RAW
+                    if engine.flashEffect {
+                        Color.white.opacity(0.65)
+                            .allowsHitTesting(false)
+                            .transition(.opacity)
+                    }
+
+                    // Retícula animada Tap-to-Focus
+                    if let pt = engine.focusTapPoint {
+                        focusReticleView
+                            .position(pt)
+                            .onAppear {
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                                    withAnimation(.easeOut(duration: 0.25)) {
+                                        engine.focusTapPoint = nil
+                                    }
+                                }
+                            }
+                    }
+
+                    // Píldora flotante de Lentes (0.5x | 1x 48M | 2x) en la base del visor
+                    VStack {
+                        Spacer()
+                        lensFloatingPill
+                            .padding(.bottom, 12)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, engine.showFullSensorFrame ? 6 : 0)
+
+                // 3. Panel Desplegable de Ajuste Fino (solo visible cuando se toca ISO/VEL o FOCUS)
                 if activeDrawer != .none {
-                    fineControlGlassDrawer
+                    fineControlDrawer
                         .padding(.horizontal, 12)
+                        .padding(.top, 6)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
-                // 5. Panel Inferior Liquid Glass (Controles Manuales + Modos + Obturador de Cristal)
+                // 4. Barra de Dials Rápidos + Selector de Modo + Disparador Pro
                 VStack(spacing: 10) {
-                    quickGlassControlsRow
-                    modeSelectorGlassBar
-                    bottomShutterGlassDeck
+                    quickDialStrip
+                    modeSelectorBar
+                    bottomShutterDeck
                 }
                 .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .liquidGlass(cornerRadius: 28, tint: accentColor, highlighted: false)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 4)
+                .padding(.top, 8)
+                .padding(.bottom, 8)
+                .background(
+                    LinearGradient(
+                        colors: [Color.black.opacity(0.95), Color.black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
             }
         }
         .preferredColorScheme(.dark)
@@ -243,325 +164,282 @@ struct CameraView: View {
         }
     }
 
-    // MARK: - 1. HUD Superior Liquid Glass
-    private var topLiquidGlassHUD: some View {
-        VStack(spacing: 5) {
+    // MARK: - 1. Barra Superior Pro
+    private var topProBar: some View {
+        VStack(spacing: 6) {
             HStack(spacing: 8) {
-                // Pastilla brillante del modo activo
                 HStack(spacing: 5) {
                     Circle()
-                        .fill(engine.isRecording ? Color.red : Color.black)
-                        .frame(width: 6.5, height: 6.5)
+                        .fill(engine.isRecording ? Color.red : accentColor)
+                        .frame(width: 7, height: 7)
                     Text(engine.mode.rawValue)
-                        .font(.system(size: 10.5, weight: .black, design: .rounded))
+                        .font(.system(size: 11, weight: .black, design: .monospaced))
                         .foregroundColor(.black)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4.5)
-                .background(
-                    LinearGradient(
-                        colors: [Color.white, accentColor],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(accentColor)
                 .clipShape(Capsule())
 
                 Text(engine.activeSensorFormatText)
                     .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.95))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-
-                Spacer()
-
-                // Histograma cáustico en vivo
-                HStack(alignment: .bottom, spacing: 1.4) {
-                    ForEach(Array(engine.histogramBins.enumerated()), id: \.offset) { _, val in
-                        RoundedRectangle(cornerRadius: 1)
-                            .fill(
-                                LinearGradient(
-                                    colors: [ Color.white, accentColor.opacity(0.8) ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                            .frame(width: 2.0, height: max(2, CGFloat(val) * 20))
-                    }
-                }
-                .frame(height: 22)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(Color.black.opacity(0.35))
-                .clipShape(Capsule())
-            }
-
-            HStack(spacing: 8) {
-                Text(engine.statusBanner)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundColor(.white.opacity(0.82))
+                    .foregroundColor(.white.opacity(0.92))
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
 
                 Spacer()
 
-                // Medidor de FPS reales
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(engine.measuredFPS >= 23 ? Color.green : Color.orange)
-                        .frame(width: 6, height: 6)
-                    Text(String(format: "%.0f FPS", engine.measuredFPS))
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
-                        .foregroundColor(.white)
+                // Histograma en vivo
+                HStack(alignment: .bottom, spacing: 1.3) {
+                    ForEach(Array(engine.histogramBins.enumerated()), id: \.offset) { _, val in
+                        RoundedRectangle(cornerRadius: 0.8)
+                            .fill(accentColor.opacity(0.9))
+                            .frame(width: 2.0, height: max(2, CGFloat(val) * 22))
+                    }
                 }
-                .padding(.horizontal, 8)
+                .frame(height: 24)
+                .padding(.horizontal, 6)
                 .padding(.vertical, 3)
-                .background(Color.white.opacity(0.10))
-                .clipShape(Capsule())
+                .background(Color.white.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+
+            HStack(spacing: 8) {
+                Text(engine.statusBanner)
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.78))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                Spacer()
+
+                Text(String(format: "%.0f FPS", engine.measuredFPS))
+                    .font(.system(size: 10.5, weight: .heavy, design: .monospaced))
+                    .foregroundColor(engine.measuredFPS >= 23 ? .green : .yellow)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.white.opacity(0.1))
+                    .clipShape(Capsule())
+
+                Button {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                        engine.showFullSensorFrame.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: engine.showFullSensorFrame ? "viewfinder" : "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 10, weight: .bold))
+                        Text(engine.showFullSensorFrame ? "100% SENSOR" : "LLENAR")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    }
+                    .foregroundColor(engine.showFullSensorFrame ? .black : .white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3.5)
+                    .background(engine.showFullSensorFrame ? Color.white : Color.white.opacity(0.15))
+                    .clipShape(Capsule())
+                }
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .liquidGlass(cornerRadius: 20, tint: accentColor, highlighted: engine.isRecording)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
-    // MARK: - 2. Marco de Cristal del Visor y Guías
-    private func viewfinderGlassOverlay(width: CGFloat, height: CGFloat) -> some View {
-        ZStack {
-            if engine.showGridLines {
-                Path { p in
-                    p.move(to: CGPoint(x: width / 3, y: 0))
-                    p.addLine(to: CGPoint(x: width / 3, y: height))
-                    p.move(to: CGPoint(x: 2 * width / 3, y: 0))
-                    p.addLine(to: CGPoint(x: 2 * width / 3, y: height))
-                    p.move(to: CGPoint(x: 0, y: height / 3))
-                    p.addLine(to: CGPoint(x: width, y: height / 3))
-                    p.move(to: CGPoint(x: 0, y: 2 * height / 3))
-                    p.addLine(to: CGPoint(x: width, y: 2 * height / 3))
+    // MARK: - 2. Guías Ópticas y Marco del Sensor Completo
+    private var viewfinderOverlay: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            let frameAspect = (engine.mode == .video8KFluid) ? (9.0 / 16.0) : (3.0 / 4.0)
+            let boxHeight = min(h, w / frameAspect)
+            let boxWidth = min(w, boxHeight * frameAspect)
+
+            ZStack {
+                if engine.showGridLines {
+                    Path { p in
+                        let x0 = (w - boxWidth) * 0.5
+                        let y0 = (h - boxHeight) * 0.5
+                        p.move(to: CGPoint(x: x0 + boxWidth / 3, y: y0))
+                        p.addLine(to: CGPoint(x: x0 + boxWidth / 3, y: y0 + boxHeight))
+                        p.move(to: CGPoint(x: x0 + 2 * boxWidth / 3, y: y0))
+                        p.addLine(to: CGPoint(x: x0 + 2 * boxWidth / 3, y: y0 + boxHeight))
+                        p.move(to: CGPoint(x: x0, y: y0 + boxHeight / 3))
+                        p.addLine(to: CGPoint(x: x0 + boxWidth, y: y0 + boxHeight / 3))
+                        p.move(to: CGPoint(x: x0, y: y0 + 2 * boxHeight / 3))
+                        p.addLine(to: CGPoint(x: x0 + boxWidth, y: y0 + 2 * boxHeight / 3))
+                    }
+                    .stroke(Color.white.opacity(0.20), lineWidth: 0.6)
                 }
-                .stroke(Color.white.opacity(0.22), lineWidth: 0.65)
-            }
 
-            // Borde especular Liquid Glass alrededor del área exacta capturada
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            engine.isRecording ? Color.red : Color.white.opacity(0.75),
-                            accentColor.opacity(0.35),
-                            Color.white.opacity(0.15),
-                            engine.isRecording ? Color.red : accentColor.opacity(0.65)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: engine.isRecording ? 2.2 : 1.3
-                )
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(
+                        engine.isRecording ? Color.red.opacity(0.85) : accentColor.opacity(0.55),
+                        lineWidth: engine.isRecording ? 2.0 : 1.1
+                    )
+                    .frame(width: boxWidth, height: boxHeight)
 
-            // Píldora superior de proporción real dentro del visor
-            VStack {
-                HStack {
-                    Text(engine.mode == .videoFluid ? "ENCUADRE 9:16 VERTICAL EXACTO" : "ENCUADRE 3:4 SENSOR COMPLETO")
-                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .liquidGlass(cornerRadius: 12, tint: accentColor, highlighted: false)
+                VStack {
+                    HStack {
+                        Text(engine.mode == .video8KFluid ? "9:16 VERTICAL • \(engine.resolutionTier.rawValue)" : "3:4 • SENSOR COMPLETO SIN RECORTE")
+                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                            .foregroundColor(accentColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.black.opacity(0.65))
+                            .clipShape(Capsule())
+                        Spacer()
+                    }
+                    .padding(8)
                     Spacer()
                 }
-                .padding(10)
-                Spacer()
+                .frame(width: boxWidth, height: boxHeight)
             }
+            .frame(width: w, height: h)
         }
-        .frame(width: width, height: height)
         .allowsHitTesting(false)
     }
 
-    private var focusGlassOrb: some View {
+    private var focusReticleView: some View {
         ZStack {
-            Circle()
-                .fill(Color.white.opacity(0.12))
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(Color.yellow, lineWidth: 1.8)
                 .frame(width: 68, height: 68)
-                .liquidGlass(cornerRadius: 34, tint: .yellow, highlighted: true)
             Circle()
                 .fill(Color.yellow)
-                .frame(width: 6, height: 6)
+                .frame(width: 5, height: 5)
         }
     }
 
-    private var masteringGlassOverlay: some View {
-        VStack(spacing: 10) {
-            ProgressView(value: engine.masteringProgress, total: 1.0)
-                .progressViewStyle(.linear)
-                .tint(accentColor)
-                .frame(width: 190)
-            Text(String(format: "MASTERIZANDO %@ SIN PÉRDIDA: %.0f%%", engine.resolutionTier.rawValue, engine.masteringProgress * 100))
-                .font(.system(size: 10.5, weight: .black, design: .monospaced))
-                .foregroundColor(.white)
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
-        .liquidGlass(cornerRadius: 20, tint: accentColor, highlighted: true)
-    }
-
-    // MARK: - Píldora Flotante Liquid Glass de Lentes (0.5x • 1x • 2x)
-    private var lensLiquidGlassDock: some View {
-        HStack(spacing: 8) {
+    // MARK: - Selector Flotante de Lentes (0.5x | 1x 48M | 2x)
+    private var lensFloatingPill: some View {
+        HStack(spacing: 6) {
             ForEach(LensChoice.allCases) { l in
                 let isSelected = (engine.lens == l)
                 Button {
-                    guard !engine.isRecording, !engine.isMasteringVideo else { return }
+                    guard !engine.isRecording else { return }
                     UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.74)) {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.75)) {
                         engine.lens = l
                     }
                 } label: {
                     Text(l.rawValue)
-                        .font(.system(size: 12, weight: .black, design: .rounded))
+                        .font(.system(size: 12, weight: .black, design: .monospaced))
                         .foregroundColor(isSelected ? .black : .white)
-                        .frame(width: isSelected ? 46 : 38, height: 34)
-                        .background(
-                            Group {
-                                if isSelected {
-                                    LinearGradient(
-                                        colors: [Color.white, accentColor],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    )
-                                } else {
-                                    Color.white.opacity(0.08)
-                                }
-                            }
-                        )
+                        .padding(.horizontal, isSelected ? 13 : 10)
+                        .padding(.vertical, 7)
+                        .background(isSelected ? accentColor : Color.white.opacity(0.14))
                         .clipShape(Capsule())
                 }
             }
         }
         .padding(5)
-        .liquidGlass(cornerRadius: 24, tint: accentColor, highlighted: false)
+        .background(.ultraThinMaterial)
+        .clipShape(Capsule())
     }
 
-    // MARK: - 3. Barra Liquid Glass de Resolución (8K / 6K / 4.3K) y FPS (24 / 30 / 60)
-    private var videoResolutionAndFPSGlassBar: some View {
-        HStack(spacing: 8) {
-            // Selector de Resolución: 8K UHD | 6K PRO | 4.3K DIRECTO
-            HStack(spacing: 4) {
-                ForEach(VideoResolutionTier.allCases) { tier in
-                    let active = (engine.resolutionTier == tier)
-                    Button {
-                        guard !engine.isRecording, !engine.isMasteringVideo else { return }
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.78)) {
+    // MARK: - 3. Tira de Píldoras Pro (8K/6K/4.3K + 24/30/60 FPS + Exposición + Enfoque + Guías)
+    private var quickDialStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                if engine.mode != .rawPhoto {
+                    // Selector directo 8K | 6K | 4.3K
+                    ForEach(VideoResolutionTier.allCases) { tier in
+                        let active = (engine.resolutionTier == tier)
+                        Button {
+                            guard !engine.isRecording else { return }
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             engine.resolutionTier = tier
+                        } label: {
+                            Text(tier.rawValue)
+                                .font(.system(size: 11, weight: .black, design: .monospaced))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(active ? accentColor : Color.white.opacity(0.1))
+                                .foregroundColor(active ? .black : .white)
+                                .clipShape(Capsule())
                         }
-                    } label: {
-                        Text(tier.rawValue)
-                            .font(.system(size: 9.5, weight: .black, design: .monospaced))
-                            .foregroundColor(active ? .black : .white.opacity(0.9))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(
-                                active
-                                    ? AnyShapeStyle(LinearGradient(colors: [Color.white, accentColor], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    : AnyShapeStyle(Color.white.opacity(0.06))
-                            )
-                            .clipShape(Capsule())
                     }
-                }
-            }
-            .padding(3)
-            .liquidGlass(cornerRadius: 18, tint: accentColor, highlighted: false)
 
-            Spacer(minLength: 4)
-
-            // Selector de FPS: 24 | 30 | 60 (disponible en TODOS los modos de video)
-            HStack(spacing: 4) {
-                ForEach(fpsOptions, id: \.self) { fps in
-                    let active = (engine.targetFPS == fps)
-                    Button {
-                        guard !engine.isRecording, !engine.isMasteringVideo else { return }
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(.spring(response: 0.24, dampingFraction: 0.78)) {
+                    // Selector directo 24 | 30 | 60 FPS en cualquier modo de video
+                    ForEach(fpsOptions, id: \.self) { fps in
+                        let active = (engine.targetFPS == fps)
+                        Button {
+                            guard !engine.isRecording else { return }
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
                             engine.targetFPS = fps
+                        } label: {
+                            Text("\(fps) FPS")
+                                .font(.system(size: 11, weight: .black, design: .monospaced))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(active ? Color.white : Color.white.opacity(0.1))
+                                .foregroundColor(active ? .black : .white)
+                                .clipShape(Capsule())
                         }
-                    } label: {
-                        Text("\(fps)")
-                            .font(.system(size: 10.5, weight: .black, design: .monospaced))
-                            .foregroundColor(active ? .black : .white.opacity(0.9))
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 6)
-                            .background(
-                                active
-                                    ? AnyShapeStyle(LinearGradient(colors: [Color.white, accentColor], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                    : AnyShapeStyle(Color.white.opacity(0.06))
-                            )
-                            .clipShape(Capsule())
                     }
                 }
-            }
-            .padding(3)
-            .liquidGlass(cornerRadius: 18, tint: accentColor, highlighted: false)
-        }
-    }
 
-    // MARK: - 4. Tira de Píldoras Manuales Liquid Glass
-    private var quickGlassControlsRow: some View {
-        HStack(spacing: 8) {
-            Button {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.8)) {
-                    activeDrawer = (activeDrawer == .exposure) ? .none : .exposure
+                // Píldora Exposición / ISO / Obturador
+                Button {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                        activeDrawer = (activeDrawer == .exposure) ? .none : .exposure
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "dial.medium.fill")
+                            .font(.system(size: 11))
+                        Text(engine.manualExposure ? "M • ISO \(Int(engine.isoValue))" : "EXP AUTO")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .background(activeDrawer == .exposure || engine.manualExposure ? Color.yellow : Color.white.opacity(0.1))
+                    .foregroundColor(activeDrawer == .exposure || engine.manualExposure ? .black : .white)
+                    .clipShape(Capsule())
                 }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "dial.medium.fill")
-                        .font(.system(size: 11))
-                    Text(engine.manualExposure ? "ISO \(Int(engine.isoValue))" : "EXP AUTO")
-                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6.5)
-                .liquidGlass(cornerRadius: 16, tint: .yellow, highlighted: activeDrawer == .exposure || engine.manualExposure)
-                .foregroundColor(.white)
-            }
 
-            Button {
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.8)) {
-                    activeDrawer = (activeDrawer == .focus) ? .none : .focus
+                // Píldora Enfoque Manual / AF
+                Button {
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                        activeDrawer = (activeDrawer == .focus) ? .none : .focus
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "scope")
+                            .font(.system(size: 11))
+                        Text(engine.manualFocus ? String(format: "MF %.2f", engine.focusPosition) : "AF CONTINUO")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .background(activeDrawer == .focus || engine.manualFocus ? Color.cyan : Color.white.opacity(0.1))
+                    .foregroundColor(activeDrawer == .focus || engine.manualFocus ? .black : .white)
+                    .clipShape(Capsule())
                 }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "scope")
-                        .font(.system(size: 11))
-                    Text(engine.manualFocus ? String(format: "MF %.2f", engine.focusPosition) : "AF")
-                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6.5)
-                .liquidGlass(cornerRadius: 16, tint: .cyan, highlighted: activeDrawer == .focus || engine.manualFocus)
-                .foregroundColor(.white)
-            }
 
-            Spacer()
-
-            Button {
-                engine.showGridLines.toggle()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "grid")
-                        .font(.system(size: 11))
-                    Text("GUÍAS")
-                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                // Píldora Rejilla
+                Button {
+                    engine.showGridLines.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "grid")
+                            .font(.system(size: 11))
+                        Text("GUÍAS")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(engine.showGridLines ? Color.white.opacity(0.22) : Color.white.opacity(0.08))
+                    .foregroundColor(.white)
+                    .clipShape(Capsule())
                 }
-                .padding(.horizontal, 11)
-                .padding(.vertical, 6.5)
-                .liquidGlass(cornerRadius: 16, tint: .white, highlighted: engine.showGridLines)
-                .foregroundColor(.white)
             }
         }
     }
 
-    // MARK: - Cajón Desplegable Liquid Glass (ISO / Obturación / Enfoque)
-    private var fineControlGlassDrawer: some View {
+    // MARK: - Cajón Desplegable de Exposición o Enfoque Manual
+    private var fineControlDrawer: some View {
         VStack(spacing: 8) {
             if activeDrawer == .exposure {
                 HStack {
@@ -604,14 +482,14 @@ struct CameraView: View {
                 }
             } else if activeDrawer == .focus {
                 HStack {
-                    Toggle("ENFOQUE MANUAL", isOn: $engine.manualFocus)
+                    Toggle("ENFOQUE MANUAL (PEAKING)", isOn: $engine.manualFocus)
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .tint(.cyan)
                         .onChange(of: engine.manualFocus) { _ in engine.applyFocusSettings() }
 
                     Spacer()
                     if engine.manualFocus {
-                        Text(String(format: "LENTE %.2f", engine.focusPosition))
+                        Text(String(format: "DISTANCIA %.2f", engine.focusPosition))
                             .font(.system(size: 11, weight: .black, design: .monospaced))
                             .foregroundColor(.cyan)
                     }
@@ -625,50 +503,45 @@ struct CameraView: View {
                 }
             }
         }
-        .padding(12)
-        .liquidGlass(cornerRadius: 20, tint: accentColor, highlighted: true)
+        .padding(10)
+        .background(Color.white.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
     }
 
-    // MARK: - 5. Selector de Modos en Vidrio Líquido
-    private var modeSelectorGlassBar: some View {
-        HStack(spacing: 6) {
-            ForEach(CaptureMode.allCases) { m in
-                let selected = (engine.mode == m)
-                Button {
-                    guard !engine.isRecording, !engine.isMasteringVideo else { return }
-                    UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-                    withAnimation(.spring(response: 0.26, dampingFraction: 0.78)) {
-                        engine.mode = m
+    // MARK: - 4. Selector de los 3 Modos Principales
+    private var modeSelectorBar: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 8) {
+                ForEach(CaptureMode.allCases) { m in
+                    let selected = (engine.mode == m)
+                    Button {
+                        guard !engine.isRecording else { return }
+                        UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            engine.mode = m
+                        }
+                    } label: {
+                        Text(m.rawValue)
+                            .font(.system(size: 11.5, weight: .black, design: .monospaced))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(selected ? accentColor : Color.white.opacity(0.08))
+                            .foregroundColor(selected ? .black : .white.opacity(0.85))
+                            .clipShape(Capsule())
                     }
-                } label: {
-                    Text(m.rawValue)
-                        .font(.system(size: 11, weight: .black, design: .rounded))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(
-                            Group {
-                                if selected {
-                                    LinearGradient(
-                                        colors: [Color.white, accentColor],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    )
-                                } else {
-                                    Color.white.opacity(0.06)
-                                }
-                            }
-                        )
-                        .foregroundColor(selected ? .black : .white.opacity(0.88))
-                        .clipShape(Capsule())
                 }
             }
+            Text(engine.mode.subtitle)
+                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                .foregroundColor(.white.opacity(0.65))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
     }
 
-    // MARK: - 6. Cubierta Inferior con Obturador "Liquid Glass Orb"
-    private var bottomShutterGlassDeck: some View {
+    // MARK: - 5. Cubierta Inferior: Miniatura / Exportar .DNG + Disparador Pro + Contador 8K
+    private var bottomShutterDeck: some View {
         HStack {
-            // Botón de última captura / Compartir .DNG o .MOV
             Button {
                 if engine.lastCapturedFileURL != nil {
                     showShareSheet = true
@@ -680,93 +553,62 @@ struct CameraView: View {
                             .resizable()
                             .scaledToFill()
                             .frame(width: 44, height: 44)
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .stroke(Color.white.opacity(0.7), lineWidth: 1.2)
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(accentColor, lineWidth: 1.5)
                             )
                     } else {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.white.opacity(0.08))
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.white.opacity(0.1))
                             .frame(width: 44, height: 44)
                             .overlay(
                                 Image(systemName: "square.and.arrow.up")
                                     .font(.system(size: 16, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.75))
+                                    .foregroundColor(.white.opacity(0.6))
                             )
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("EXPORTAR")
-                            .font(.system(size: 9.5, weight: .black, design: .rounded))
-                            .foregroundColor(.white)
-                        Text(".DNG / MOV")
-                            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                        Text(engine.lastCapturedFileURL != nil ? "EXPORTAR" : "ARCHIVOS")
+                            .font(.system(size: 9.5, weight: .black, design: .monospaced))
                             .foregroundColor(accentColor)
+                        Text(".DNG / 8K")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.65))
                     }
                 }
             }
-            .frame(width: 115, alignment: .leading)
+            .frame(width: 118, alignment: .leading)
 
             Spacer()
 
-            // Botón de Obturador Liquid Glass (Disco refractivo estilo Vidrio.tendies)
             Button {
                 engine.triggerPrimaryAction()
             } label: {
                 ZStack {
-                    // Anillo exterior de cristal líquido con reflejo especular
                     Circle()
-                        .fill(.ultraThinMaterial)
-                        .frame(width: 76, height: 76)
-                        .overlay(
-                            Circle()
-                                .strokeBorder(
-                                    LinearGradient(
-                                        colors: [
-                                            Color.white.opacity(0.95),
-                                            accentColor.opacity(0.65),
-                                            Color.white.opacity(0.20)
-                                        ],
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    ),
-                                    lineWidth: 3.0
-                                )
-                        )
-                        .shadow(color: accentColor.opacity(0.38), radius: 12, x: 0, y: 4)
+                        .strokeBorder(accentColor, lineWidth: 3.5)
+                        .frame(width: 74, height: 74)
 
                     if engine.mode == .rawPhoto {
                         Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color.white, accentColor.opacity(0.85)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .frame(width: 58, height: 58)
+                            .fill(engine.isCapturingPhoto ? Color.yellow : Color.white)
+                            .frame(width: 60, height: 60)
                     } else {
-                        RoundedRectangle(cornerRadius: engine.isRecording ? 10 : 29, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color(red: 1.0, green: 0.28, blue: 0.32), Color(red: 0.82, green: 0.05, blue: 0.15)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
+                        RoundedRectangle(cornerRadius: engine.isRecording ? 8 : 30)
+                            .fill(Color.red)
                             .frame(
-                                width: engine.isRecording ? 32 : 58,
-                                height: engine.isRecording ? 32 : 58
+                                width: engine.isRecording ? 32 : 60,
+                                height: engine.isRecording ? 32 : 60
                             )
-                            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: engine.isRecording)
+                            .animation(.spring(response: 0.24, dampingFraction: 0.72), value: engine.isRecording)
                     }
                 }
             }
 
             Spacer()
 
-            // Telemetría derecha
             VStack(alignment: .trailing, spacing: 3) {
                 if engine.isRecording {
                     Text(String(format: "%02d:%02d", Int(engine.recordingElapsedSeconds) / 60, Int(engine.recordingElapsedSeconds) % 60))
@@ -776,23 +618,23 @@ struct CameraView: View {
                         .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
                 } else {
-                    Text(engine.mode == .rawPhoto ? "48 MP RAW" : engine.resolutionTier.rawValue)
-                        .font(.system(size: 11.5, weight: .black, design: .rounded))
-                        .foregroundColor(.white)
-                    Text(engine.mode == .rawPhoto ? "PRO DNG" : "\(engine.targetFPS) FPS REALES")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    Text(engine.mode == .rawPhoto ? "48 MP RAW" : "\(engine.resolutionTier.rawValue) • \(engine.targetFPS)F")
+                        .font(.system(size: 11.5, weight: .black, design: .monospaced))
                         .foregroundColor(accentColor)
+                    Text(engine.mode == .rawPhoto ? "SIN DEEP FUSION" : "HEVC HARDWARE")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.65))
                 }
             }
-            .frame(width: 115, alignment: .trailing)
+            .frame(width: 118, alignment: .trailing)
         }
     }
 
     private var accentColor: Color {
         switch engine.mode {
-        case .rawPhoto: return Color(red: 1.0, green: 0.84, blue: 0.28)
-        case .videoFluid: return Color(red: 0.25, green: 0.90, blue: 1.0)
-        case .videoOpenGate: return Color(red: 0.72, green: 0.52, blue: 1.0)
+        case .rawPhoto: return .yellow
+        case .video8KFluid: return .cyan
+        case .video8KSensor48MP: return .orange
         }
     }
 }
