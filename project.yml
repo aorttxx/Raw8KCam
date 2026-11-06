@@ -1,0 +1,25 @@
+name: Raw8KCam
+options:
+  bundleIdPrefix: com.angelortiz
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Raw8KCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+        excludes:
+          - Info.plist
+    info:
+      path: Sources/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.angelortiz.raw8kcam
+        PRODUCT_NAME: Raw8KCam
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO

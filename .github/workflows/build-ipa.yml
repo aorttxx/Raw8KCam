@@ -1,0 +1,42 @@
+name: Compilar Raw8KCam IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Generar proyecto Xcode con XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Compilar aplicación para iPhone (arm64 sin firma)
+        run: |
+          xcodebuild build \
+            -project Raw8KCam.xcodeproj \
+            -scheme Raw8KCam \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Empaquetar archivo Raw8KCam.ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/Raw8KCam.app Payload/
+          zip -r9 Raw8KCam.ipa Payload
+
+      - name: Subir Raw8KCam.ipa listo para Sideloadly / SideStore / AltStore
+        uses: actions/upload-artifact@v4
+        with:
+          name: Raw8KCam-IPA
+          path: Raw8KCam.ipa
