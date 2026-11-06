@@ -7,14 +7,14 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: macos-15
+    runs-on: macos-14
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
 
       - name: Generar proyecto Xcode con XcodeGen
         run: |
-          brew install xcodegen
+          which xcodegen || brew install xcodegen
           xcodegen generate
 
       - name: Compilar aplicación para iPhone (arm64 sin firma)
